@@ -1,32 +1,66 @@
-.cacheopt-settings .cacheopt-hint {
-    font-size: 0.85em;
-    opacity: 0.75;
-    margin: 4px 0;
-    line-height: 1.45;
+.cacheopt-settings .cacheopt-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin: 10px 0;
 }
 
-.cacheopt-settings .cacheopt-report {
-    font-size: 0.82em;
-    white-space: pre-wrap;
-    word-break: break-all;
-    font-family: var(--monoFontFamily, monospace);
-    background: var(--black30a, rgba(0, 0, 0, 0.18));
-    border-radius: 6px;
-    padding: 6px 8px;
-    margin: 4px 0 8px;
-    max-height: 320px;
-    overflow-y: auto;
+.cacheopt-settings .cacheopt-row .menu_button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 1 1 180px;
+    min-width: 0;
+    padding: 8px 10px;
+    margin: 0;
+    white-space: normal;
+    word-break: normal;
+    text-align: center;
     line-height: 1.5;
 }
 
-.cacheopt-settings .cacheopt-row {
-    display: flex;
-    gap: 8px;
-    margin: 6px 0;
-    flex-wrap: wrap;
+.cacheopt-settings .cacheopt-report {
+    margin-top: 8px;
+    padding: 10px;
+    border-radius: 6px;
+    background: var(--black30a, rgba(0, 0, 0, 0.3));
+    font-size: 0.9em;
+    line-height: 1.6;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+.cacheopt-settings .cacheopt-hint {
+    margin-top: 6px;
+    opacity: 0.8;
+    font-size: 0.85em;
+    line-height: 1.5;
+    overflow-wrap: anywhere;
 }
 
 .cacheopt-settings .cacheopt-num {
-    width: 64px;
+    width: 4em;
+    flex: 0 0 4em;
     display: inline-block;
+    margin: 0 4px;
+}
+
+.cacheopt-settings .cacheopt-label {
+    display: block;
+    margin-top: 8px;
+}
+
+.cacheopt-settings .cacheopt-label .text_pole {
+    width: 100%;
+    margin-top: 4px;
+}
+
+.cacheopt-settings .checkbox_label {
+    align-items: flex-start;
+    margin: 6px 0;
+}
+
+.cacheopt-settings .checkbox_label > input[type="checkbox"] {
+    flex-shrink: 0;
+    margin-top: 3px;
 }

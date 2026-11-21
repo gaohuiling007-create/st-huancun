@@ -1,59 +1,65 @@
-// 缓存优化 Cache Optimizer v3 —— 前缀冻结
+// ST-Cache-Optimizer 2.4.4
 //
-// Gemini / Vertex 的隐式缓存只认「从头开始一字不差的前缀」：
-//   · 开头所有 system 消息会被合并成一个 systemInstruction（parts 拼接），
-//     其中任何一处变化，它后面的 token 全部作废；
-//   · 之后按消息顺序做前缀匹配，遇到第一处不同就停。
-//
-// 所以「让某几块内容保持不动」这种思路永远治不好：只要系统提示里有一块每轮在变，
-// 它后面的一切都白给。v3 换成一种能保证收敛的做法：
-//
-//   1. 第一轮记下开头 system 区（骨架）的每一块；
-//   2. 之后每轮逐块比对：内容变了 / 消失了的块，就地换成固定的占位符，
-//      真实内容挪到提示词最末尾（离生成位置最近，注意力最高）；
-//   3. 骨架里没有的新块，一律只放末尾，绝不往系统提示里塞。
-//
-// 于是系统提示从第二轮起就是逐字节冻结的，缓存前缀永远成立；
-// 变化的只有末尾那一小段。附带的好处是完全不改世界书、不改预设、不改角色卡。
-//
-// 另外提供两件诊断工具：
-//   · 真实请求对比：拿实际发出的两次请求比，报告相同前缀比例和第一处不同的位置；
-//   · 用量观测：读服务端返回的 cachedContentTokenCount / cached_tokens，
-//     算出真实命中率 —— 这样才能区分「没锁住」和「服务端压根没缓存」。
+// 只调整当前请求中的提示词，不修改世界书文件。
+// 请求诊断观察浏览器 -> 酒馆后端的消息及响应副本。
+// 后端转换后的最终 Google 请求不在前端诊断范围内。
+// 字符前缀比例不等于实际缓存 token 命中率。
 
-const VERSION = '3.4.0';
 const MODULE = 'cacheOptimizer';
-const LS_KEY = 'cacheopt_v3_skeleton';
-const MAX_SKELETONS = 4;
-const MAX_STORE_CHARS = 1_500_000;
-const MAX_RECENT = 6;
-const GENERATE_PATH = '/api/backends/chat-completions/generate';
 
-const TAIL_OPEN = '<动态设定（本轮最新）>';
-const TAIL_CLOSE = '</动态设定（本轮最新）>';
-const STUB_HEAD = '〔动态设定已移至对话末尾〕';
-
-const DEFAULTS = Object.freeze({
+const DEFAULTS = {
     enabled: true,
-    freezeHead: true,
-    moveTail: true,
-    verbose: true,
-});
-
-// 一眼就知道每轮会变的内容：EJS 变量、随机/时间宏、MVU 变量块
-const DYNAMIC_RE = /<%[\s\S]*?%>|\{\{\s*(random|roll|pick|time|date|weekday|isotime|isodate|datetimeformat|idle_duration|lastMessage|lastUserMessage|lastCharMessage|lastMessageId)/i;
-// 更严格的一档：建骨架时就能确定「它一定每轮变」，直接按占位符起手，省掉一轮试错
-const STRICT_DYNAMIC_RE = /<status_current_variables>|\{\{\s*(random|roll|pick|time|date|weekday|isotime|isodate|datetimeformat|idle_duration|lastMessage|lastUserMessage|lastCharMessage|lastMessageId)|stat_data|getMessageVar/i;
-
-const state = {
-    skeletons: new Map(), // chatId -> { slots: [{key,text,stub,misses}], at, allStub }
-    requests: new Map(),  // chatId -> { at, msgs: string[] }
-    usage: null,          // { cached, prompt, at }
-    report: '',           // 上一次真实请求对比的文字
-    lastRun: '还没发送过请求',
+    routeWorldInfo: true,
+    hoistStatic: true,
+    learn: true,
+    stickyLore: false,
+    stickyTurns: 6,
+    volatileHeads: ['〔记忆系统私密简报'],
+    learnedHeads: [],
+    keepPatterns: 'output_format|Force_Structured|^<\\/?Format>|jailbreak|破限',
 };
 
-// ───────────────────────── 基础 ─────────────────────────
+const WRAP_OPEN = '<当前剧情相关设定>';
+const WRAP_CLOSE = '</当前剧情相关设定>';
+const WRAP_WORLD = '__cache_optimizer__';
+const STATIC_OPEN = '<固定设定>';
+const STATIC_CLOSE = '</固定设定>';
+const STICKY_OPEN = '<近期剧情设定>';
+const STICKY_CLOSE = '</近期剧情设定>';
+
+const TOP_DEPTH = 10000;
+const STICKY_ORDER_BASE = 2000000;
+const HOIST_ORDER_BASE = 100000;
+const MAX_LEARNED = 30;
+const MAX_LEARN_CHARS = 20000;
+
+const POS = {
+    before: 0,
+    after: 1,
+    anTop: 2,
+    anBottom: 3,
+    atDepth: 4,
+    emTop: 5,
+    emBottom: 6,
+    outlet: 7,
+};
+
+const DYNAMIC_EJS = /stat_data|getMessageVar|getvar\(\s*['"`]stat_data|random|Math\.|Date|roll|_\.(sample|shuffle)|lastUserMessage|lastCharMessage|chat\[|incvar|addvar/;
+const DYNAMIC_MACRO = /\{\{(roll|random|pick|time|date|weekday|isotime|isodate|datetimeformat|idle_duration|lastMessage|lastUserMessage|lastCharMessage|lastMessageId)/i;
+const DYNAMIC_TAG = /<status_current_variables>\s*(<%|\{\{)/i;
+
+const GENERATE_PATH = '/api/backends/chat-completions/generate';
+const RECENT_LIMIT = 12;
+const MAX_EVENT_CHARS = 2 * 1024 * 1024;
+
+let lastRun = '尚未处理生成请求';
+let lastSystemBlocks = null;
+let checking = false;
+let recentReal = [];
+let latestReal = null;
+let lastUsageReport = '等待响应缓存用量。';
+
+const changeCounts = new Map();
 
 function ctx() {
     return SillyTavern.getContext();
@@ -62,9 +68,18 @@ function ctx() {
 function settings() {
     const all = ctx().extensionSettings;
     all[MODULE] ??= structuredClone(DEFAULTS);
+
     for (const [key, value] of Object.entries(DEFAULTS)) {
         all[MODULE][key] ??= structuredClone(value);
     }
+
+    if (!Array.isArray(all[MODULE].volatileHeads)) {
+        all[MODULE].volatileHeads = [...DEFAULTS.volatileHeads];
+    }
+    if (!Array.isArray(all[MODULE].learnedHeads)) {
+        all[MODULE].learnedHeads = [];
+    }
+
     return all[MODULE];
 }
 
@@ -72,434 +87,1052 @@ function save() {
     ctx().saveSettingsDebounced();
 }
 
-function text(message) {
-    return typeof message?.content === 'string' ? message.content : '';
+function chatId() {
+    return ctx().getCurrentChatId?.() ?? '';
 }
 
-/** 粗略识别平台：iOS / iPadOS（iPadOS 13+ 伪装成 Mac，靠触点数量区分）/ Android */
-function platformLabel() {
-    try {
-        const ua = navigator.userAgent || '';
-        if (/iPhone|iPad|iPod/i.test(ua)) return 'iOS/iPadOS';
-        if (/Macintosh/i.test(ua) && (navigator.maxTouchPoints || 0) > 1) return 'iOS/iPadOS';
-        if (/Android/i.test(ua)) return 'Android';
-    } catch { /* 忽略 */ }
+function text(message) {
+    if (typeof message?.content === 'string') return message.content;
+
+    if (Array.isArray(message?.content)) {
+        return message.content
+            .filter(part => part?.type === 'text'
+                && typeof part.text === 'string')
+            .map(part => part.text)
+            .join('\n');
+    }
+
     return '';
 }
 
-/** 当前跑在什么壳里：TauriTavern 原生客户端 or 浏览器 */
-function hostLabel() {
-    const p = platformLabel();
-    try {
-        const h = window.__TAURITAVERN_HOST__;
-        if (h && h.platform) return `TauriTavern（${h.platform}/${h.kind ?? 'desktop'}）`;
-        if (window.__TAURI_RUNNING__) return `TauriTavern${p ? `（${p}）` : ''}`;
-    } catch { /* 忽略 */ }
-    if (p) return `${p} 浏览器`;
-    return '浏览器';
+function stableJSON(value) {
+    function sorted(v) {
+        if (Array.isArray(v)) return v.map(sorted);
+
+        if (v && typeof v === 'object') {
+            return Object.fromEntries(
+                Object.keys(v).sort().map(key => [key, sorted(v[key])]),
+            );
+        }
+
+        return v;
+    }
+
+    return JSON.stringify(sorted(value)) ?? '';
 }
 
-function currentChatId() {
-    const c = ctx();
+function keepRegex() {
     try {
-        return c.getCurrentChatId?.() ?? c.chatId ?? 'default';
+        return new RegExp(settings().keepPatterns, 'im');
     } catch {
-        return 'default';
+        return new RegExp(DEFAULTS.keepPatterns, 'im');
     }
 }
 
-function keyOf(content) {
-    return String(content ?? '').replace(/\s+/g, ' ').trim().slice(0, 48);
+// ───────────────── 世界书现场调整 ─────────────────
+
+function isDynamicContent(entry) {
+    const content = String(entry.content ?? '');
+    const blocks = content.match(/<%[\s\S]*?%>/g) ?? [];
+
+    return blocks.some(block => DYNAMIC_EJS.test(block))
+        || DYNAMIC_MACRO.test(content)
+        || DYNAMIC_TAG.test(content)
+        || (!!entry.useProbability
+            && Number(entry.probability ?? 100) < 100);
 }
 
-function stubText(key) {
-    const label = String(key ?? '').replace(/[<>{}\[\]]/g, '').slice(0, 16).trim();
-    return label ? `${STUB_HEAD}（原「${label}…」）` : STUB_HEAD;
+function isDynamicEntry(entry) {
+    return isDynamicContent(entry)
+        || Number(entry.sticky) > 0
+        || Number(entry.cooldown) > 0
+        || Number(entry.delay) > 0;
 }
 
-/** 开头连续 system 消息的数量：Gemini 会把这些合并成 systemInstruction */
-function leadingSystemCount(chat) {
-    let i = 0;
-    while (i < chat.length && chat[i]?.role === 'system' && typeof chat[i].content === 'string') i++;
-    return i;
+function presetSlotBeforeHistory(identifier) {
+    const orders = ctx().chatCompletionSettings?.prompt_order ?? [];
+    const order = (
+        orders.find(item => item.character_id === 100001) ?? orders[0]
+    )?.order ?? [];
+
+    const index = id => order.findIndex(
+        item => item.identifier === id && item.enabled !== false,
+    );
+
+    const slot = index(identifier);
+    const history = index('chatHistory');
+
+    return slot < 0 || history < 0 || slot < history;
 }
 
-// ───────────────────────── 骨架存取 ─────────────────────────
+function systemBlocksGetMerged() {
+    const cc = ctx().chatCompletionSettings ?? {};
 
-function loadSkeletons() {
-    try {
-        const raw = localStorage.getItem(LS_KEY);
-        if (!raw) return;
-        const obj = JSON.parse(raw);
-        for (const [chatId, sk] of Object.entries(obj ?? {})) {
-            if (sk && Array.isArray(sk.slots)) state.skeletons.set(chatId, sk);
-        }
-    } catch (e) {
-        console.warn('[缓存优化] 读取骨架失败', e);
-    }
+    return ['makersuite', 'vertexai'].includes(cc.chat_completion_source)
+        || !!cc.custom_prompt_post_processing;
 }
 
-function persist() {
-    try {
-        const entries = [...state.skeletons.entries()]
-            .sort((a, b) => (b[1]?.at ?? 0) - (a[1]?.at ?? 0))
-            .slice(0, MAX_SKELETONS);
-        const raw = JSON.stringify(Object.fromEntries(entries));
-        if (raw.length > MAX_STORE_CHARS) {
-            localStorage.removeItem(LS_KEY);
-            return;
-        }
-        localStorage.setItem(LS_KEY, raw);
-    } catch (e) {
-        console.warn('[缓存优化] 保存骨架失败', e);
-    }
-}
+function routeEntries(lists) {
+    const s = settings();
+    if (!s.enabled || !s.routeWorldInfo) return;
 
-function makeSkeleton(blocks) {
-    return {
-        slots: blocks.map(m => {
-            const body = text(m);
-            const key = keyOf(body);
-            if (STRICT_DYNAMIC_RE.test(body)) {
-                return { key, text: stubText(key), stub: true, misses: 0 };
-            }
-            return { key, text: body, stub: false, misses: 0 };
-        }),
-        at: Date.now(),
+    const keep = keepRegex();
+    const beforeOk = presetSlotBeforeHistory('worldInfoBefore');
+    const afterOk = presetSlotBeforeHistory('worldInfoAfter');
+    const stickyOn = s.stickyLore && !systemBlocksGetMerged();
+    const stickyTurns = Math.max(
+        1, Math.floor(Number(s.stickyTurns) || DEFAULTS.stickyTurns),
+    );
+
+    let moved = null;
+    let top = null;
+    let sticky = null;
+
+    const visited = new WeakSet();
+
+    const toTop = (entry, list, order) => {
+        Object.assign(entry, {
+            position: POS.atDepth,
+            depth: TOP_DEPTH,
+            role: 0,
+            order,
+        });
+        top ??= { entry, list };
     };
+
+    for (const list of lists) {
+        if (!Array.isArray(list)) continue;
+
+        // 使用快照，包装条目在扫描完成后添加。
+        for (const entry of [...list]) {
+            if (!entry || typeof entry !== 'object'
+                || visited.has(entry)
+                || entry.disable
+                || entry.world === WRAP_WORLD) continue;
+
+            visited.add(entry);
+
+            const firstLine = String(entry.content ?? '')
+                .trimStart().split('\n', 1)[0];
+
+            if (keep.test(String(entry.comment ?? ''))
+                || keep.test(firstLine)) continue;
+
+            const position = Number(entry.position);
+
+            if (position === POS.before || position === POS.after) {
+                if (stickyOn
+                    && !entry.constant
+                    && !isDynamicContent(entry)) {
+                    Object.assign(entry, {
+                        position: POS.atDepth,
+                        depth: TOP_DEPTH,
+                        role: 0,
+                        order: STICKY_ORDER_BASE
+                            + (position === POS.after ? 50000 : 0)
+                            + (Number(entry.order) || 0),
+                        sticky: Math.max(
+                            Number(entry.sticky) || 0, stickyTurns,
+                        ),
+                    });
+
+                    sticky ??= { entry, list };
+                } else if (!entry.constant || isDynamicEntry(entry)) {
+                    Object.assign(entry, {
+                        position: POS.atDepth,
+                        depth: 0,
+                        role: 0,
+                    });
+
+                    moved ??= { entry, list };
+                } else if (
+                    position === POS.before ? !beforeOk : !afterOk
+                ) {
+                    toTop(
+                        entry,
+                        list,
+                        (position === POS.after ? 50000 : 0)
+                            + (Number(entry.order) || 0),
+                    );
+                }
+            } else if (
+                position === POS.atDepth
+                && (!entry.constant || isDynamicEntry(entry))
+            ) {
+                if (Number(entry.depth) !== 0) {
+                    entry.depth = 0;
+                    moved ??= { entry, list };
+                }
+            } else if (
+                s.hoistStatic
+                && entry.constant
+                && !isDynamicEntry(entry)
+                && [POS.atDepth, POS.anTop, POS.anBottom].includes(position)
+            ) {
+                const depth = position === POS.atDepth
+                    ? Number(entry.depth) || 0
+                    : 0;
+
+                const order = HOIST_ORDER_BASE
+                    + (100 - Math.min(depth, 99)) * 1000
+                    + (Number(entry.order) || 0);
+
+                if (beforeOk) {
+                    Object.assign(entry, {
+                        position: POS.before,
+                        order,
+                    });
+                } else {
+                    toTop(entry, list, order);
+                }
+            }
+        }
+    }
+
+    const wrapper = (entry, uid, content, order, depth) => ({
+        ...entry,
+        uid,
+        world: WRAP_WORLD,
+        comment: content,
+        content,
+        order,
+        key: [],
+        keysecondary: [],
+        constant: true,
+        disable: false,
+        selective: false,
+        useProbability: false,
+        probability: 100,
+        group: '',
+        groupOverride: false,
+        sticky: 0,
+        cooldown: 0,
+        delay: 0,
+        position: POS.atDepth,
+        depth,
+        role: 0,
+        excludeRecursion: true,
+        preventRecursion: true,
+    });
+
+    const addPair = (
+        target, uid, open, close, firstOrder, lastOrder, depth,
+    ) => {
+        if (!target) return;
+
+        target.list.push(
+            wrapper(target.entry, uid, open, firstOrder, depth),
+            wrapper(target.entry, uid - 1, close, lastOrder, depth),
+        );
+    };
+
+    addPair(
+        moved, -910001, WRAP_OPEN, WRAP_CLOSE,
+        -1000000, 1000000, 0,
+    );
+
+    addPair(
+        top, -910003, STATIC_OPEN, STATIC_CLOSE,
+        -1000000, 1000000, TOP_DEPTH,
+    );
+
+    addPair(
+        sticky, -910005, STICKY_OPEN, STICKY_CLOSE,
+        STICKY_ORDER_BASE - 500000,
+        STICKY_ORDER_BASE + 1000000,
+        TOP_DEPTH,
+    );
 }
 
-// ───────────────────────── 核心：前缀冻结 ─────────────────────────
+// ───────────────── 重排与学习 ─────────────────
 
-/**
- * 用骨架匹配本轮的开头 system 块，产出「新的开头」和「要挪到末尾的内容」。
- * @param {any[]} blocks 本轮开头 system 块
- * @param {any} sk 骨架
- * @param {any} r 统计累加器
- */
-function matchSkeleton(blocks, sk, r) {
-    const used = new Set();
-    const outHead = [];
+function headOf(message) {
+    return text(message).trimStart().split('\n', 1)[0].slice(0, 40);
+}
+
+function isTopBlock(message) {
+    const value = text(message).trimStart();
+    return value.startsWith(STATIC_OPEN)
+        || value.startsWith(STICKY_OPEN);
+}
+
+function isVolatileHead(head) {
+    const s = settings();
+    return [...s.volatileHeads, ...s.learnedHeads]
+        .some(value => value && head.startsWith(value));
+}
+
+function normalize(value) {
+    return String(value ?? '').replace(/\s+/g, ' ').trim();
+}
+
+function historySnippets() {
+    return (ctx().chat ?? [])
+        .filter(message => message && !message.is_system
+            && typeof message.mes === 'string'
+            && message.mes.trim())
+        .slice(-60)
+        .map(message => {
+            const value = normalize(message.mes);
+            if (value.length <= 60) return [value];
+
+            return [0.3, 0.5, 0.7].map(position => {
+                const start = Math.floor(value.length * position);
+                return value.slice(start, start + 30);
+            });
+        });
+}
+
+function findHistoryRange(chat) {
+    const snippets = historySnippets();
+    if (!snippets.length) return null;
+
+    let start = -1;
+    let end = -1;
+
+    chat.forEach((message, index) => {
+        if (message.role === 'system') return;
+
+        const value = normalize(text(message));
+
+        if (value && snippets.some(parts =>
+            parts.some(part => part && value.includes(part)))) {
+            if (start < 0) start = index;
+            end = index;
+        }
+    });
+
+    return start < 0 ? null : { start, end };
+}
+
+function canMoveSystem(message) {
+    // 工具调用、多模态内容和保持原位的规则不参与重排。
+    return message?.role === 'system'
+        && typeof message.content === 'string'
+        && !message.tool_calls
+        && !message.tool_call_id
+        && !isTopBlock(message)
+        && !keepRegex().test(headOf(message));
+}
+
+function reorder(chat) {
+    const range = findHistoryRange(chat);
+    const start = range?.start
+        ?? chat.findIndex(message => message.role !== 'system');
+    const end = range?.end
+        ?? chat.findLastIndex(message => message.role === 'user');
+
+    if (start < 0 || end < 0) return 0;
+
+    const anchor = chat[end];
     const moved = [];
 
-    for (const slot of sk.slots) {
-        const idx = slot.key
-            ? blocks.findIndex((b, i) => !used.has(i) && keyOf(text(b)) === slot.key)
-            : -1;
-        const body = idx >= 0 ? text(blocks[idx]) : null;
-        if (idx >= 0) { used.add(idx); r.matched++; }
-
-        // 已经冻结的槽位：永远吐占位符，真实内容进末尾
-        if (slot.stub) {
-            outHead.push({ role: 'system', content: slot.text });
-            r.stubbed++;
-            if (body && body.trim()) {
-                moved.push(body);
-                r.movedBlocks++;
-                r.movedChars += body.length;
-            }
-            continue;
-        }
-
-        // 和上一轮一字不差：原样保留
-        if (body !== null && body === slot.text) {
-            outHead.push(blocks[idx]);
-            r.kept++;
-            r.keptChars += body.length;
-            continue;
-        }
-
-        // 内容变了，或者这一轮没出现
-        slot.misses = (slot.misses || 0) + 1;
-        const obvious = body !== null && (DYNAMIC_RE.test(body) || body.length < 500);
-        if (body !== null && !obvious && slot.misses < 3) {
-            // 大块 + 不常变（改预设、改角色卡）：就地更新，认一次不命中
-            slot.text = body;
-            outHead.push(blocks[idx]);
-            r.kept++;
-            r.keptChars += body.length;
-            continue;
-        }
-
-        // 判定为易变块：换成占位符，真实内容挪到末尾
-        slot.stub = true;
-        slot.text = stubText(slot.key || keyOf(body ?? ''));
-        outHead.push({ role: 'system', content: slot.text });
-        r.stubbed++;
-        if (body && body.trim()) {
-            moved.push(body);
-            r.movedBlocks++;
-            r.movedChars += body.length;
+    for (let i = end - 1; i > start; i--) {
+        if (canMoveSystem(chat[i])) {
+            moved.unshift(...chat.splice(i, 1));
         }
     }
 
-    // 骨架里没有的新块：一律只放末尾，绝不塞进系统提示
-    for (let i = 0; i < blocks.length; i++) {
-        if (used.has(i)) continue;
-        const body = text(blocks[i]);
-        if (!body.trim()) continue;
-        moved.push(body);
-        r.movedBlocks++;
-        r.movedChars += body.length;
+    for (let i = start - 1; i >= 0; i--) {
+        const value = text(chat[i]).trimStart();
+
+        if (canMoveSystem(chat[i])
+            && ((isVolatileHead(headOf(chat[i]))
+                && value.length <= MAX_LEARN_CHARS)
+                || value.startsWith(WRAP_OPEN))) {
+            moved.unshift(...chat.splice(i, 1));
+        }
     }
 
-    return { outHead, moved };
+    if (moved.length) {
+        const at = chat.indexOf(anchor);
+        chat.splice(range ? at + 1 : at, 0, ...moved);
+    }
+
+    return moved.length;
 }
 
-/**
- * 把开头 system 区改写成「冻结骨架 + 末尾追加真实动态内容」。
- * @param {any[]} chat 提示词消息数组（原地修改）
- * @param {boolean} dryRun 试运行：只算不改状态
- */
-function stabilize(chat, dryRun) {
+function learnFrom(chat) {
     const s = settings();
-    const chatId = currentChatId();
-    const headLen = leadingSystemCount(chat);
-    const r = {
-        chatId, headLen, kept: 0, stubbed: 0, keptChars: 0, matched: 0,
-        movedBlocks: 0, movedChars: 0, created: false, reset: false, skipped: '',
-    };
+    if (!s.learn) return [];
 
-    if (!s.enabled || !s.freezeHead) { r.skipped = 'off'; return r; }
-    if (headLen < 2) { r.skipped = headLen === 1 ? 'single' : 'empty'; return r; }
+    const currentChat = chatId();
 
-    const blocks = chat.slice(0, headLen).filter(m => text(m).trim());
-    if (blocks.length < 2) { r.skipped = 'single'; return r; }
-
-    let sk = state.skeletons.get(chatId);
-    if (!sk) {
-        if (dryRun) { r.skipped = 'noskel'; return r; }
-        sk = makeSkeleton(blocks);
-        state.skeletons.set(chatId, sk);
-        persist();
-        r.created = true;
-    }
-    if (dryRun) sk = JSON.parse(JSON.stringify(sk));
-
-    let res = matchSkeleton(blocks, sk, r);
-
-    // 一块都对不上 = 换了预设 / 换了卡：就地重建骨架，再用新骨架重跑一遍，
-    // 这样只付「这一轮」，下一轮立刻恢复命中
-    if (r.matched === 0 && r.stubbed >= 2 && !dryRun) {
-        sk = makeSkeleton(blocks);
-        state.skeletons.set(chatId, sk);
-        persist();
-        Object.assign(r, { kept: 0, stubbed: 0, keptChars: 0, matched: 0, movedBlocks: 0, movedChars: 0 });
-        res = matchSkeleton(blocks, sk, r);
-        r.reset = true;
-        state.lastRun = '检测到换了预设/角色卡，已重建骨架';
-    }
-    const { outHead, moved } = res;
-
-    if (!dryRun) {
-        sk.at = Date.now();
-        persist();
+    if (lastSystemBlocks
+        && lastSystemBlocks.chatId !== currentChat) {
+        changeCounts.clear();
     }
 
-    chat.splice(0, headLen, ...outHead);
+    const range = findHistoryRange(chat);
+    const firstTurn = chat.findIndex(message => message.role !== 'system');
+    const stop = range?.start
+        ?? (firstTurn < 0 ? chat.length : firstTurn);
 
-    if (s.moveTail && moved.length) {
-        const body = `${TAIL_OPEN}\n${moved.join('\n\n')}\n${TAIL_CLOSE}`;
-        chat.push({ role: 'system', content: body });
-        r.tailChars = body.length;
+    const blocks = chat.slice(0, stop)
+        .filter(canMoveSystem)
+        .map(message => ({
+            head: headOf(message),
+            body: text(message),
+        }));
+
+    const learned = [];
+
+    if (lastSystemBlocks?.chatId === currentChat) {
+        const previous = new Map();
+        const duplicates = new Set();
+        const currentCounts = new Map();
+
+        for (const block of lastSystemBlocks.blocks) {
+            if (previous.has(block.head)) duplicates.add(block.head);
+            previous.set(block.head, block.body);
+        }
+
+        for (const block of blocks) {
+            currentCounts.set(
+                block.head,
+                (currentCounts.get(block.head) ?? 0) + 1,
+            );
+        }
+
+        for (const block of blocks) {
+            if (block.head.length < 4
+                || duplicates.has(block.head)
+                || currentCounts.get(block.head) > 1
+                || !previous.has(block.head)
+                || previous.get(block.head) === block.body
+                || isVolatileHead(block.head)
+                || block.body.length > MAX_LEARN_CHARS) continue;
+
+            const count = (changeCounts.get(block.head) ?? 0) + 1;
+            changeCounts.set(block.head, count);
+
+            if (count < 2) continue;
+
+            s.learnedHeads.push(block.head);
+            learned.push(block.head);
+        }
+
+        if (learned.length) {
+            s.learnedHeads = [...new Set(s.learnedHeads)]
+                .slice(-MAX_LEARNED);
+            save();
+        }
     }
 
-    const tag = r.reset ? '（已重建骨架）' : '';
-    state.lastRun = r.stubbed
-        ? `${new Date().toLocaleTimeString()}${tag} 冻结 ${r.stubbed} 块 / 保留 ${r.kept} 块，动态内容 ${r.movedChars.toLocaleString()} 字移到末尾`
-        : `${new Date().toLocaleTimeString()}${tag} 系统提示全静态，保留 ${r.kept} 块`;
-    return r;
+    lastSystemBlocks = { chatId: currentChat, blocks };
+    return learned;
 }
 
-// ───────────────────────── 真实请求观测 ─────────────────────────
+function onPromptReady(data) {
+    if (!settings().enabled || !Array.isArray(data?.chat)) return;
 
-function snippet(line, offset) {
-    const from = Math.max(0, offset - 30);
-    return `…${String(line).slice(from, offset + 60).replace(/\s+/g, ' ')}…`;
+    const count = reorder(data.chat);
+    if (data.dryRun || checking) return;
+
+    const learned = learnFrom(data.chat);
+
+    lastRun = `${new Date().toLocaleTimeString()} 重排：移动 ${count} 个块`
+        + (learned.length
+            ? `；新学到 ${learned.length} 个易变块`
+            : '');
+
+    $('#cacheopt_last').text(lastRun);
+    renderLearned();
 }
 
-function describeDiff(prev, cur) {
-    const A = prev.msgs;
-    const B = cur.msgs;
-    const total = B.reduce((n, t) => n + t.length + 1, 0) || 1;
+// ───────────────── 免费模拟检查 ─────────────────
+
+function sharedPrefix(a, b) {
     let k = 0;
-    while (k < A.length && k < B.length && A[k] === B[k]) k++;
-    const chars = A.slice(0, k).reduce((n, t) => n + t.length + 1, 0);
-    let off = 0;
-    if (k < A.length && k < B.length) {
-        while (off < A[k].length && A[k][off] === B[k][off]) off++;
+
+    while (k < a.length && k < b.length && a[k] === b[k]) k++;
+
+    let at = 0;
+
+    if (k < a.length && k < b.length) {
+        while (at < a[k].length
+            && at < b[k].length
+            && a[k][at] === b[k][at]) at++;
     }
 
-    const headA = A.findIndex(t => !t.startsWith('[system]'));
-    const headB = B.findIndex(t => !t.startsWith('[system]'));
-    const ha = headA < 0 ? A.length : headA;
-    const hb = headB < 0 ? B.length : headB;
-    const headSame = ha === hb && A.slice(0, ha).every((t, i) => t === B[i]);
+    const chars = a.slice(0, k)
+        .reduce((sum, value) => sum + value.length + 1, 0) + at;
 
-    const gap = Math.round((cur.at - prev.at) / 1000);
-    const lines = [
-        `${new Date(cur.at).toLocaleTimeString()}｜与 ${gap} 秒前那次真实请求对比（${A.length} 条 → ${B.length} 条消息）`,
-        `系统提示（前 ${hb} 条）：${headSame ? '✅ 逐字一致' : '❌ 有变化 —— 这一轮基本 0 命中'}`,
-        `相同前缀：${(chars / total * 100).toFixed(1)}%（${chars.toLocaleString()} / ${total.toLocaleString()} 字）`,
-    ];
-    if (k < B.length) {
-        const role = B[k].match(/^\[(\w+)\]/)?.[1] ?? '?';
-        lines.push(`第一处不同：第 ${k + 1} 条（${role}）第 ${off} 字`);
-        lines.push(`　上次：${snippet(A[k] ?? '（无）', off)}`);
-        lines.push(`　这次：${snippet(B[k], off)}`);
-        const fromEnd = B.length - 1 - k;
-        if (k === B.length - 1) lines.push('　（只差在最后一条：这正是理想状态）');
-        else if (fromEnd <= 6) lines.push(`　（距末尾 ${fromEnd} 条，属于正常的深度注入，损失有限）`);
-        else lines.push(`　（距末尾还有 ${fromEnd} 条 —— 有东西插进了聊天记录中前段，这一段之后的缓存都会丢）`);
-    } else {
-        lines.push('两次完全相同');
-    }
-    if (!headSame) lines.push('提示：系统提示没锁住，多半是有扩展在生成时往开头插了东西，或开了「合并系统消息 / 提示词后处理」。');
-    if (gap > 300) lines.push(`⚠ 间隔 ${gap} 秒，Gemini 隐式缓存可能已经过期（实测 10 分钟以上基本没了）`);
-    return lines.join('\n');
+    return { k, at, chars };
 }
 
-/**
- * 记下这一轮真正发出去的消息序列。
- * 有两条路会调它：拦到请求体（浏览器 / TT 都可用），以及 PROMPT_READY 事件（宿主把请求藏起来时的兜底）。
- * 同一轮被记两次时（两条路都通），内容相同就跳过，避免"自己跟自己对比"。
- */
-function noteSent(msgs) {
-    const chatId = currentChatId();
-    const now = Date.now();
-    const prev = state.requests.get(chatId);
-    if (prev && prev.msgs.length === msgs.length && prev.msgs.every((m, i) => m === msgs[i])) return;
-    if (prev) state.report = describeDiff(prev, { at: now, msgs });
-    state.requests.set(chatId, { at: now, msgs });
-    if (state.requests.size > MAX_RECENT) {
-        const oldest = [...state.requests.entries()].sort((a, b) => a[1].at - b[1].at)[0];
-        state.requests.delete(oldest[0]);
-    }
-    render();
-}
+async function captureDryRun() {
+    const c = ctx();
+    let captured = null;
 
-function recordRequest(raw) {
-    let body;
-    try { body = JSON.parse(raw); } catch { return; }
-    if (!Array.isArray(body?.messages) || body.type === 'quiet') return;
-    noteSent(body.messages.map(m => `[${m.role}]${text(m)}`));
-}
-
-function maxNum(txt, re) {
-    let best = null;
-    for (const m of txt.matchAll(re)) {
-        const n = Number(m[1]);
-        if (Number.isFinite(n) && (best === null || n > best)) best = n;
-    }
-    return best;
-}
-
-async function observeResponse(res) {
-    try {
-        if (!res || typeof res.clone !== 'function') return;
-        const raw = await res.clone().text();
-        if (!raw) return;
-        // Google 原生：usageMetadata.cachedContentTokenCount / promptTokenCount
-        const cached = maxNum(raw, /"cachedContentTokenCount"\s*:\s*(\d+)/g)
-            ?? maxNum(raw, /"cached_tokens"\s*:\s*(\d+)/g)
-            ?? maxNum(raw, /"cache_read_input_tokens"\s*:\s*(\d+)/g);
-        const prompt = maxNum(raw, /"promptTokenCount"\s*:\s*(\d+)/g)
-            ?? maxNum(raw, /"prompt_tokens"\s*:\s*(\d+)/g)
-            ?? maxNum(raw, /"input_tokens"\s*:\s*(\d+)/g);
-        const output = maxNum(raw, /"candidatesTokenCount"\s*:\s*(\d+)/g)
-            ?? maxNum(raw, /"completion_tokens"\s*:\s*(\d+)/g);
-        if (prompt === null && cached === null) return;
-        state.usage = { cached: cached ?? 0, prompt: prompt ?? 0, output: output ?? 0, at: Date.now() };
-        render();
-    } catch (e) {
-        console.debug('[缓存优化] 读取用量失败', e);
-    }
-}
-
-function watchNetwork() {
-    if (window.fetch?.__cacheoptV3) return;
-    const original = window.fetch;
-    const wrapped = function (input, init) {
-        const url = typeof input === 'string' ? input : input?.url ?? '';
-        const hit = url.includes(GENERATE_PATH) && typeof init?.body === 'string';
-        if (hit) {
-            try { recordRequest(init.body); } catch { /* 旁观而已 */ }
+    const handler = data => {
+        if (Array.isArray(data?.chat)) {
+            captured = structuredClone(data.chat);
         }
-        const promise = original.apply(this, arguments);
-        if (hit) {
-            promise.then(res => { observeResponse(res).catch(() => {}); }).catch(() => {});
-        }
-        return promise;
     };
-    wrapped.__cacheoptV3 = true;
+
+    c.eventSource.on(c.eventTypes.CHAT_COMPLETION_PROMPT_READY, handler);
+
+    try {
+        await c.generate('normal', {}, true);
+    } finally {
+        c.eventSource.removeListener(
+            c.eventTypes.CHAT_COMPLETION_PROMPT_READY,
+            handler,
+        );
+    }
+
+    return captured;
+}
+
+async function checkStability() {
+    if (checking) return;
+
+    const c = ctx();
+    const report = $('#cacheopt_report');
+
+    if (c.mainApi !== 'openai') {
+        report.text('只支持对话补全（Chat Completion）接口。');
+        return;
+    }
+
+    const lastUser = c.chat.findLastIndex(message => message.is_user);
+
+    if (lastUser < 2) {
+        report.text('聊天记录太短，至少需要两轮对话。');
+        return;
+    }
+
+    checking = true;
+    $('#cacheopt_check').attr('aria-disabled', 'true');
+    report.text('模拟检查中，不调用模型。请等待完成后再操作聊天。');
+
+    try {
+        let previous;
+
+        // 与原版相同，通过临时截短内存聊天模拟上一轮。
+        // 无论组装成功与否，都恢复被移除的消息。
+        const removed = c.chat.splice(lastUser - 1);
+
+        try {
+            previous = await captureDryRun();
+        } finally {
+            c.chat.push(...removed);
+        }
+
+        const current = await captureDryRun();
+
+        if (!previous || !current) {
+            report.text('检查失败：没有捕获到组装后的提示词。');
+            return;
+        }
+
+        const a = previous.map(stableJSON);
+        const b = current.map(stableJSON);
+        const { k, at, chars } = sharedPrefix(a, b);
+        const total = b.reduce(
+            (sum, value) => sum + value.length + 1, 0,
+        );
+
+        const leadingSystem = list => {
+            const result = [];
+
+            for (const message of list) {
+                if (message.role !== 'system') break;
+                result.push(message);
+            }
+
+            return stableJSON(result);
+        };
+
+        const systemSame =
+            leadingSystem(previous) === leadingSystem(current);
+
+        report.text([
+            `开头系统消息一致：${systemSame ? '✅ 是' : '❌ 否，可能影响缓存'}`,
+            `消息序列化前缀相同：${
+                total ? (chars / total * 100).toFixed(1) : '0.0'
+            }%（${chars.toLocaleString()} / ${total.toLocaleString()} 字符）`,
+            `前 ${k} 条消息完整相同。`,
+            k < previous.length && k < current.length
+                ? `首个变化：第 ${k + 1} 条（${current[k]?.role}），序列化位置 ${at}。`
+                : '其中一组消息是另一组的完整前缀。',
+            '这是字符稳定性比较，不是实际缓存 token 命中率。',
+            '模拟不包含后端 Google 格式转换，以及部分扩展仅在真实生成时执行的修改。',
+        ].join('\n'));
+    } finally {
+        checking = false;
+        $('#cacheopt_check').removeAttr('aria-disabled');
+    }
+}
+
+// ───────────────── 真实请求诊断 ─────────────────
+
+function requestGroup(body) {
+    return stableJSON({
+        chatId: chatId(),
+        source: body.chat_completion_source
+            ?? ctx().chatCompletionSettings?.chat_completion_source
+            ?? '',
+        model: body.model ?? '',
+        type: body.type ?? 'unknown',
+        region: body.vertexai_region ?? '',
+        secretId: body.secret_id ?? '',
+        proxy: body.reverse_proxy ?? '',
+        customUrl: body.custom_url ?? '',
+    });
+}
+
+function toolDefinition(body) {
+    return stableJSON({
+        tools: body.tools ?? null,
+        functions: body.functions ?? null,
+        tool_choice: body.tool_choice ?? null,
+        function_call: body.function_call ?? null,
+    });
+}
+
+function prefixConfig(body) {
+    return stableJSON({
+        use_sysprompt: body.use_sysprompt ?? null,
+        char_name: body.char_name ?? null,
+        user_name: body.user_name ?? null,
+        group_names: body.group_names ?? null,
+        custom_prompt_post_processing:
+            body.custom_prompt_post_processing ?? null,
+        enable_web_search: body.enable_web_search ?? null,
+        json_schema: body.json_schema ?? null,
+        responseMimeType: body.responseMimeType ?? null,
+        responseSchema: body.responseSchema ?? null,
+    });
+}
+
+function publishReal(cur) {
+    if (latestReal !== cur) return;
+    $('#cacheopt_real').text(cur.lines.join('\n'));
+}
+
+function recordRealRequest(rawBody) {
+    let body;
+
+    try {
+        body = JSON.parse(rawBody);
+    } catch {
+        return null;
+    }
+
+    if (!body || !Array.isArray(body.messages)) return null;
+
+    const now = Date.now();
+
+    const cur = {
+        group: requestGroup(body),
+        at: now,
+        chatId: chatId(),
+        model: String(body.model ?? '未提供'),
+        type: String(body.type ?? '未标记'),
+        stream: Boolean(body.stream),
+        texts: body.messages.map(stableJSON),
+        roles: body.messages.map(message => message?.role ?? '?'),
+        tools: toolDefinition(body),
+        config: prefixConfig(body),
+        lines: [],
+    };
+
+    const previous = recentReal.findLast(
+        item => item.group === cur.group,
+    );
+
+    cur.lines.push(
+        `${new Date().toLocaleTimeString()}｜模型：${cur.model}`,
+        `用途：${cur.type}；${cur.stream ? '流式' : '非流式'}`,
+        `当前 ${cur.texts.length} 条消息；包含数组内容和工具调用字段。`,
+    );
+
+    if (cur.type === '未标记') {
+        cur.lines.push('请求未标记用途，同组仍可能混入辅助请求。');
+    }
+
+    if (previous) {
+        const { k, at, chars } = sharedPrefix(
+            previous.texts, cur.texts,
+        );
+
+        const total = cur.texts.reduce(
+            (sum, value) => sum + value.length + 1, 0,
+        );
+
+        cur.lines.push(
+            `对比同组紧邻上一次请求：${Math.round((now - previous.at) / 1000)} 秒前`,
+            `消息数量：${previous.texts.length} → ${cur.texts.length}`,
+            `消息序列化前缀相同：${
+                total ? (chars / total * 100).toFixed(1) : '0.0'
+            }%（${chars.toLocaleString()} / ${total.toLocaleString()} 字符）`,
+            `前 ${k} 条消息完整相同。`,
+        );
+
+        if (k === previous.texts.length && k === cur.texts.length) {
+            cur.lines.push('消息字段完全相同。');
+        } else if (k === previous.texts.length) {
+            cur.lines.push('本次在上次消息序列末尾追加了消息。');
+        } else if (k === cur.texts.length) {
+            cur.lines.push('本次消息序列比上次更短。');
+        } else {
+            cur.lines.push(
+                `首个变化：第 ${k + 1} 条（${cur.roles[k]}），`
+                + `序列化字符位置 ${at}。`,
+            );
+        }
+
+        cur.lines.push(
+            previous.tools === cur.tools
+                ? '工具定义及调用配置：相同。'
+                : '⚠ 工具定义或调用配置发生变化。',
+            previous.config === cur.config
+                ? '系统提示开关、名称、后处理及输出格式配置：相同。'
+                : '⚠ 系统提示开关、名称、后处理或输出格式配置发生变化。',
+        );
+    } else {
+        cur.lines.push('当前组首次记录，下一次同组请求后比较。');
+    }
+
+    cur.lines.push(
+        '比较范围：浏览器 → 酒馆后端。后端可能再次转换消息。',
+        '字符比例不是缓存 token 命中率；实际报告见下方。',
+    );
+
+    latestReal = cur;
+    recentReal.push(cur);
+    recentReal = recentReal.slice(-RECENT_LIMIT);
+
+    publishReal(cur);
+    return cur;
+}
+
+// ───────────────── 响应用量诊断 ─────────────────
+
+function readUsage(value, state) {
+    if (!value || typeof value !== 'object') return;
+
+    if (Array.isArray(value)) {
+        for (const item of value) readUsage(item, state);
+        return;
+    }
+
+    const validCount = count =>
+        typeof count === 'number'
+        && Number.isFinite(count)
+        && count >= 0;
+
+    const google = value.usageMetadata ?? value.usage_metadata;
+
+    if (google && typeof google === 'object') {
+        state.sawUsage = true;
+
+        const count = google.cachedContentTokenCount
+            ?? google.cached_content_token_count;
+
+        if (validCount(count)) {
+            state.cached = count;
+            state.field = 'usageMetadata.cachedContentTokenCount';
+        }
+    }
+
+    const usage = value.usage;
+
+    if (usage && typeof usage === 'object') {
+        state.sawUsage = true;
+
+        const count = usage.prompt_tokens_details?.cached_tokens
+            ?? usage.input_tokens_details?.cached_tokens;
+
+        if (validCount(count)) {
+            state.cached = count;
+            state.field = 'usage.*_tokens_details.cached_tokens';
+        }
+    }
+
+    // 部分中转将响应包在这些字段中。
+    for (const key of ['data', 'response', 'result']) {
+        if (value[key] && typeof value[key] === 'object') {
+            readUsage(value[key], state);
+        }
+    }
+}
+
+function publishUsage(cur, message) {
+    // 清空诊断后，忽略仍在完成的旧请求。
+    if (!recentReal.includes(cur)) return;
+
+    lastUsageReport = [
+        `${new Date(cur.at).toLocaleTimeString()} 发出的请求`,
+        `模型：${cur.model}；用途：${cur.type}`,
+        message,
+        '这里读取浏览器收到的响应；费用面板由另一插件独立统计。',
+    ].join('\n');
+
+    $('#cacheopt_usage').text(lastUsageReport);
+}
+
+async function observeRealResponse(copy, cur) {
+    const state = {
+        cached: null,
+        sawUsage: false,
+        field: '',
+    };
+
+    let reader = null;
+    let completed = false;
+    let limited = false;
+
+    try {
+        if (!copy.ok) {
+            publishUsage(
+                cur,
+                `响应失败：HTTP ${copy.status}；无法判断缓存。`,
+            );
+            return;
+        }
+
+        const contentType = copy.headers.get('content-type') ?? '';
+
+        // 酒馆后端可能没有转发 SSE Content-Type。
+        // 优先依据原始请求中的 stream 标记。
+        const isStream = cur.stream
+            || contentType.includes('text/event-stream');
+
+        if (!isStream) {
+            readUsage(await copy.json(), state);
+            completed = true;
+        } else {
+            if (!copy.body) throw new Error('没有响应流');
+
+            reader = copy.body.getReader();
+
+            const decoder = new TextDecoder();
+            let pending = '';
+            let eventData = [];
+            let eventSize = 0;
+
+            const consumeEvent = () => {
+                const data = eventData.join('\n').trim();
+                eventData = [];
+                eventSize = 0;
+
+                if (!data || data === '[DONE]') return;
+
+                try {
+                    readUsage(JSON.parse(data), state);
+                } catch {
+                    // 非 JSON 事件不参与用量判断。
+                }
+            };
+
+            const consumeLine = line => {
+                line = line.replace(/\r$/, '');
+
+                if (!line) {
+                    consumeEvent();
+                } else if (line.startsWith('data:')) {
+                    const data = line.slice(5).replace(/^ /, '');
+                    eventData.push(data);
+                    eventSize += data.length;
+                }
+            };
+
+            while (true) {
+                const { value, done } = await reader.read();
+
+                pending += done
+                    ? decoder.decode()
+                    : decoder.decode(value, { stream: true });
+
+                let newline;
+
+                while ((newline = pending.indexOf('\n')) >= 0) {
+                    consumeLine(pending.slice(0, newline));
+                    pending = pending.slice(newline + 1);
+
+                    if (eventSize > MAX_EVENT_CHARS) {
+                        limited = true;
+                        break;
+                    }
+                }
+
+                if (limited
+                    || pending.length + eventSize > MAX_EVENT_CHARS) {
+                    limited = true;
+                    break;
+                }
+
+                if (done) {
+                    if (pending) consumeLine(pending);
+                    consumeEvent();
+                    completed = true;
+                    break;
+                }
+            }
+        }
+
+        const suffix = completed
+            ? ''
+            : '\n诊断读取未完成，用量可能不完整。';
+
+        if (state.cached !== null) {
+            publishUsage(
+                cur,
+                (state.cached > 0
+                    ? `✅ 响应报告缓存命中：${state.cached.toLocaleString()} tokens`
+                    : '响应明确报告缓存为 0')
+                    + `\n字段：${state.field}`
+                    + suffix,
+            );
+        } else {
+            publishUsage(
+                cur,
+                (limited
+                    ? '单个诊断事件超过大小上限，已停止读取诊断副本。'
+                    : state.sawUsage
+                        ? '收到用量信息，但未发现支持的缓存字段。'
+                        : '未识别到响应中的用量信息。')
+                    + '\n字段缺失不能直接认定为实际零命中。'
+                    + '\n非流式响应可能被酒馆后端省略用量。'
+                    + suffix,
+            );
+        }
+    } catch {
+        publishUsage(
+            cur,
+            state.cached !== null
+                ? `已观察到缓存 ${state.cached.toLocaleString()} tokens；`
+                    + '诊断读取中断，用量可能不完整。'
+                : '响应诊断中断或格式不支持，无法判断实际缓存是否为零。',
+        );
+    } finally {
+        if (reader) {
+            if (!completed) {
+                // 只取消响应副本，不取消酒馆使用的原响应。
+                reader.cancel().catch(() => {});
+            } else {
+                reader.releaseLock();
+            }
+        }
+    }
+}
+
+function watchRealRequests() {
+    const original = window.fetch;
+    if (original.__cacheoptWatch) return;
+
+    const wrapped = function (input, init) {
+        let recording = Promise.resolve(null);
+        let watched = false;
+
+        try {
+            const url = typeof input === 'string'
+                ? input
+                : input instanceof URL
+                    ? input.href
+                    : input?.url;
+
+            watched = !!url
+                && new URL(url, location.href).pathname === GENERATE_PATH;
+
+            if (watched) {
+                if (typeof init?.body === 'string') {
+                    recording = Promise.resolve(
+                        recordRealRequest(init.body),
+                    );
+                } else if (
+                    typeof Request !== 'undefined'
+                    && input instanceof Request
+                    && init?.body === undefined
+                ) {
+                    recording = input.clone().text()
+                        .then(recordRealRequest)
+                        .catch(() => null);
+                }
+            }
+        } catch {
+            // 诊断失败不改变原请求。
+        }
+
+        const result = original.apply(this, arguments);
+
+        if (!watched) return result;
+
+        result.then(
+            response => {
+                // 在其他消费者读取原响应之前立即复制。
+                let copy;
+
+                try {
+                    copy = response.clone();
+                } catch {
+                    recording.then(cur => {
+                        if (cur) {
+                            publishUsage(
+                                cur,
+                                '无法创建响应诊断副本，无法判断缓存。',
+                            );
+                        }
+                    }).catch(() => {});
+                    return;
+                }
+
+                recording.then(cur => {
+                    if (!cur) {
+                        if (copy.body) {
+                            copy.body.cancel().catch(() => {});
+                        }
+                        return;
+                    }
+
+                    observeRealResponse(copy, cur).catch(() => {});
+                }).catch(() => {
+                    if (copy.body) copy.body.cancel().catch(() => {});
+                });
+            },
+            () => {
+                recording.then(cur => {
+                    if (cur) {
+                        publishUsage(
+                            cur,
+                            '请求失败或取消，无法判断实际缓存。',
+                        );
+                    }
+                }).catch(() => {});
+            },
+        );
+
+        return result;
+    };
+
+    wrapped.__cacheoptWatch = true;
     window.fetch = wrapped;
 }
 
-// ───────────────────────── 诊断 ─────────────────────────
-
-function diagnostics() {
-    const c = ctx();
-    const cc = c.chatCompletionSettings ?? {};
-    const src = String(cc.chat_completion_source ?? '');
-    const model = String(cc.google_model ?? cc.vertexai_model ?? cc.openai_model ?? cc.claude_model ?? '');
-    const lines = [];
-    const ok = t => lines.push(`✅ ${t}`);
-    const warn = t => lines.push(`⚠️ ${t}`);
-    const bad = t => lines.push(`❌ ${t}`);
-
-    if (src === 'makersuite' || src === 'vertexai') ok(`连接方式：${src === 'makersuite' ? 'Google AI Studio' : 'Vertex AI'} 直连`);
-    else bad(`连接方式：${src || '未知'} —— 不是 Google 直连。中转站/OpenAI 兼容代理基本拿不到隐式缓存，先把这里换成 Google AI Studio 或 Vertex AI`);
-
-    if (/gemini-(2\.[5-9]|[3-9])/.test(model)) ok(`模型：${model}`);
-    else warn(`模型：${model || '未知'} —— 隐式缓存需要 gemini-2.5 及以上`);
-
-    if (cc.use_sysprompt === false) warn('「使用系统提示」是关的：开头内容会被当成 user 消息，前缀照样算，但建议打开');
-    else ok('「使用系统提示」已开');
-
-    if (cc.squash_system_messages) bad('开了「合并系统消息」：所有 system 会被压成一条，插件无法逐块冻结，请关掉');
-    if (cc.custom_prompt_post_processing) bad(`开了提示词后处理（${cc.custom_prompt_post_processing}）：会合并消息，请关掉`);
-
-    const u = state.usage;
-    if (u) {
-        const pct = u.prompt ? (u.cached / u.prompt * 100) : 0;
-        lines.push(`📊 最近一次：输入 ${u.prompt.toLocaleString()} tokens，命中缓存 ${u.cached.toLocaleString()}（${pct.toFixed(1)}%）`);
-        if (u.prompt && u.prompt < 1024) warn(`输入只有 ${u.prompt} tokens，低于隐式缓存的最小长度（Flash 约 1024、Pro 约 2048）`);
-        if (u.cached === 0 && u.prompt > 2048) {
-            lines.push('　→ 前缀没问题但服务端不给缓存：常见原因是走了中转、模型不支持，或两轮间隔太久');
-        }
-    } else {
-        lines.push('📊 还没观测到用量（发送一次后自动出现）');
-    }
-    return lines.join('\n');
-}
-
-// ───────────────────────── 界面 ─────────────────────────
+// ───────────────── 设置界面 ─────────────────
 
 function setEnabled(value) {
     settings().enabled = value;
     save();
+
     $('#cacheopt_enabled').prop('checked', value);
     $('#cacheopt_menu_label').text(`缓存优化：${value ? '开' : '关'}`);
-    $('#cacheopt_menu .extensionsMenuExtensionButton').css('opacity', value ? '' : '0.4');
+
+    $('#cacheopt_menu .extensionsMenuExtensionButton')
+        .css('opacity', value ? '' : '0.4');
 }
 
-function render() {
-    const u = state.usage;
-    const sent = [...state.requests.values()].reduce((n, r) => n + 1, 0);
-    const usage = u
-        ? `本轮输入 ${u.prompt.toLocaleString()} tokens，命中缓存 ${u.cached.toLocaleString()}（${(u.prompt ? u.cached / u.prompt * 100 : 0).toFixed(1)}%）`
-        : (sent
-            ? '读不到 usage（宿主没透出 token 用量）。冻结逻辑不受影响，命中率请看服务商账单/控制台'
-            : '还没有观测到用量');
-    const ios = platformLabel() === 'iOS/iPadOS';
-    $('#cacheopt_env').text(`运行环境：${hostLabel()}${ios ? '　（iOS 锁屏/切后台会让服务端缓存过期，连续对话更划算）' : ''}`);
-    $('#cacheopt_usage').text(usage);
-    $('#cacheopt_real').text(state.report || '同一聊天连续发送两次后自动显示。');
-    $('#cacheopt_last').text(state.lastRun);
-    const sk = state.skeletons.get(currentChatId());
-    $('#cacheopt_skeleton').text(sk
-        ? `当前聊天的骨架：${sk.slots.length} 块，其中 ${sk.slots.filter(s => s.stub).length} 块已冻结`
-        : '当前聊天还没有骨架（下一次生成时建立）');
+function renderLearned() {
+    const list = settings().learnedHeads;
+
+    $('#cacheopt_learned').text(
+        list.length
+            ? `已学到的易变块（${list.length}）：${list.join(' / ')}`
+            : '已学到的易变块：暂无',
+    );
 }
 
 function bindCheckbox(id, key) {
@@ -509,123 +1142,214 @@ function bindCheckbox(id, key) {
     });
 }
 
+function clearDiagnostics() {
+    recentReal = [];
+    latestReal = null;
+    lastUsageReport = '等待响应缓存用量。';
+
+    $('#cacheopt_real').text('诊断记录已清空，等待新的真实请求。');
+    $('#cacheopt_usage').text(lastUsageReport);
+}
+
 function renderSettings() {
-    const html = `
+    $('#extensions_settings2').append(`
     <div class="cacheopt-settings">
       <div class="inline-drawer">
         <div class="inline-drawer-toggle inline-drawer-header">
-          <b>⚡ 缓存优化 v${VERSION}</b>
+          <b>⚡ 缓存优化 2.4.4</b>
           <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
         </div>
+
         <div class="inline-drawer-content">
-          <label class="checkbox_label"><input id="cacheopt_enabled" type="checkbox"> 启用缓存优化</label>
-          <label class="checkbox_label"><input id="cacheopt_freeze" type="checkbox"> 冻结系统提示前缀（核心，关掉就回到 0 命中）</label>
-          <label class="checkbox_label"><input id="cacheopt_tail" type="checkbox"> 把每轮变化的内容挪到对话末尾</label>
+          <label class="checkbox_label">
+            <input id="cacheopt_enabled" type="checkbox">
+            <span>启用提示词缓存优化</span>
+          </label>
+
+          <label class="checkbox_label">
+            <input id="cacheopt_route" type="checkbox">
+            <span>世界书现场调整：关键词 / 会变的条目移到聊天中（不改文件）</span>
+          </label>
+
+          <label class="checkbox_label">
+            <input id="cacheopt_hoist" type="checkbox">
+            <span>固定规则条目前移进系统提示</span>
+          </label>
+
+          <label class="checkbox_label">
+            <input id="cacheopt_sticky" type="checkbox">
+            <span>
+              关键词设定放到聊天记录前并保持
+              <input id="cacheopt_sticky_turns"
+                class="text_pole cacheopt-num"
+                type="number" min="1" max="50">
+              条消息
+              （Gemini / Vertex 或开启提示词后处理时自动不生效）
+            </span>
+          </label>
+
+          <label class="checkbox_label">
+            <input id="cacheopt_learn" type="checkbox">
+            <span>自动学习系统提示里的易变块</span>
+          </label>
+
+          <label class="cacheopt-label">
+            保持原位的条目（正则，匹配条目名或内容开头）
+            <input id="cacheopt_keep" class="text_pole" type="text">
+          </label>
+
           <div class="cacheopt-row">
-            <div id="cacheopt_check" class="menu_button">检查当前提示词（免费）</div>
-            <div id="cacheopt_reset" class="menu_button">重建骨架</div>
+            <button id="cacheopt_check" type="button" class="menu_button">
+              检查提示词稳定性（免费）
+            </button>
+            <button id="cacheopt_forget" type="button" class="menu_button">
+              清空已学到的易变块
+            </button>
+            <button id="cacheopt_clear" type="button" class="menu_button">
+              清空请求诊断
+            </button>
           </div>
-          <div id="cacheopt_env" class="cacheopt-hint"></div>
-          <div id="cacheopt_skeleton" class="cacheopt-hint"></div>
-          <div id="cacheopt_usage" class="cacheopt-hint"></div>
+
+          <div id="cacheopt_learned" class="cacheopt-hint"></div>
           <div id="cacheopt_last" class="cacheopt-hint"></div>
-          <div id="cacheopt_real" class="cacheopt-report">同一聊天连续发送两次后自动显示。</div>
-          <div class="cacheopt-hint">诊断：</div>
-          <div id="cacheopt_diag" class="cacheopt-report">点上面的「检查」按钮查看。</div>
+
+          <div id="cacheopt_report" class="cacheopt-report">免费检查比较消息字符前缀，不代表实际缓存命中率。</div>
+
+          <div class="cacheopt-hint">
+            真实请求对比：按聊天、接口、模型和请求用途分组，
+            比较同组紧邻上一次请求。
+          </div>
+          <div id="cacheopt_real" class="cacheopt-report">等待新的真实请求。</div>
+
+          <div class="cacheopt-hint">
+            最近完成的响应诊断：
+          </div>
+          <div id="cacheopt_usage" class="cacheopt-report"></div>
+
+          <div class="cacheopt-hint">
+            关闭上方提示词优化后，请求诊断仍继续。
+            诊断不会额外调用模型，记录只保存在当前页面内存中。
+            本扩展无法强制上游命中缓存。
+          </div>
         </div>
       </div>
-    </div>`;
-    $('#extensions_settings2').append(html);
+    </div>`);
 
-    $('#cacheopt_enabled').prop('checked', settings().enabled).on('input', function () {
-        setEnabled(!!$(this).prop('checked'));
-    });
-    bindCheckbox('#cacheopt_freeze', 'freezeHead');
-    bindCheckbox('#cacheopt_tail', 'moveTail');
+    $('#cacheopt_enabled')
+        .prop('checked', settings().enabled)
+        .on('input', function () {
+            setEnabled(!!$(this).prop('checked'));
+        });
 
-    $('#cacheopt_reset').on('click', () => {
-        state.skeletons.delete(currentChatId());
-        persist();
-        render();
-        toastr.info('骨架已清空，下一次生成时重建（这一轮不命中）', '缓存优化');
-    });
+    bindCheckbox('#cacheopt_route', 'routeWorldInfo');
+    bindCheckbox('#cacheopt_hoist', 'hoistStatic');
+    bindCheckbox('#cacheopt_learn', 'learn');
+    bindCheckbox('#cacheopt_sticky', 'stickyLore');
+
+    $('#cacheopt_sticky_turns')
+        .val(settings().stickyTurns)
+        .on('change', function () {
+            settings().stickyTurns = Math.min(
+                50,
+                Math.max(
+                    1,
+                    Math.floor(Number($(this).val()))
+                        || DEFAULTS.stickyTurns,
+                ),
+            );
+
+            $(this).val(settings().stickyTurns);
+            save();
+        });
+
+    $('#cacheopt_keep')
+        .val(settings().keepPatterns)
+        .on('change', function () {
+            const value = String($(this).val());
+
+            try {
+                new RegExp(value, 'im');
+            } catch {
+                toastr.warning('正则表达式无效，已保留原设置。', '缓存优化');
+                $(this).val(settings().keepPatterns);
+                return;
+            }
+
+            settings().keepPatterns = value;
+            save();
+        });
 
     $('#cacheopt_check').on('click', () => {
-        $('#cacheopt_diag').text(diagnostics());
-        checkCurrent().catch(e => $('#cacheopt_diag').text(`检查失败：${e?.message || e}`));
+        checkStability().catch(error => {
+            $('#cacheopt_report').text(
+                `检查失败：${error?.message || error}`,
+            );
+        });
     });
 
-    // 魔法棒菜单一键开关
-    const item = $(`<div id="cacheopt_wand_container" class="extension_container interactable" tabindex="0">
-        <div id="cacheopt_menu" class="list-group-item flex-container flexGap5 interactable" tabindex="0" role="listitem" title="一键开关缓存优化">
-          <div class="fa-solid fa-bolt extensionsMenuExtensionButton"></div><span id="cacheopt_menu_label"></span></div></div>`);
+    $('#cacheopt_forget').on('click', () => {
+        settings().learnedHeads = [];
+        changeCounts.clear();
+        lastSystemBlocks = null;
+        save();
+        renderLearned();
+    });
+
+    $('#cacheopt_clear').on('click', clearDiagnostics);
+
+    $('#cacheopt_last').text(lastRun);
+    $('#cacheopt_usage').text(lastUsageReport);
+    renderLearned();
+
+    const item = $(`
+      <div id="cacheopt_wand_container"
+        class="extension_container interactable" tabindex="0">
+        <div id="cacheopt_menu"
+          class="list-group-item flex-container flexGap5 interactable"
+          tabindex="0" role="listitem" title="切换提示词缓存优化">
+          <div class="fa-solid fa-bolt extensionsMenuExtensionButton"></div>
+          <span id="cacheopt_menu_label"></span>
+        </div>
+      </div>`);
+
     item.on('click', () => {
         setEnabled(!settings().enabled);
-        toastr.info(`缓存优化已${settings().enabled ? '开启' : '关闭'}`, '缓存优化');
+
+        toastr.info(
+            `提示词优化已${settings().enabled ? '开启' : '关闭'}，请求诊断继续`,
+            '缓存优化',
+        );
     });
+
     $('#extensionsMenu').append(item);
     setEnabled(settings().enabled);
-    render();
 }
-
-/** 只组装不发送：拿当前提示词和上一轮真实请求比 */
-async function checkCurrent() {
-    const c = ctx();
-    if (c.mainApi !== 'openai') {
-        $('#cacheopt_diag').text('只支持对话补全（Chat Completion）接口。');
-        return;
-    }
-    let captured = null;
-    const handler = data => { captured = (data?.chat ?? []).map(m => `[${m.role}]${text(m)}`); };
-    c.eventSource.on(c.eventTypes.CHAT_COMPLETION_PROMPT_READY, handler);
-    try {
-        await c.generate('normal', {}, true);
-    } finally {
-        c.eventSource.removeListener(c.eventTypes.CHAT_COMPLETION_PROMPT_READY, handler);
-    }
-    const prev = state.requests.get(currentChatId());
-    const head = [
-        diagnostics(),
-        '',
-        captured ? '当前提示词已组装成功（未发送）。' : '组装失败。',
-        prev && captured
-            ? describeDiff({ msgs: prev.msgs, at: prev.at }, { msgs: captured, at: Date.now() })
-            : '还没有上一轮真实请求可对比，先正常发送一次。',
-    ].join('\n');
-    $('#cacheopt_diag').text(head);
-}
-
-// ───────────────────────── 启动 ─────────────────────────
 
 jQuery(() => {
-    try {
-        settings();
-        loadSkeletons();
-        renderSettings();
-        watchNetwork();
-        const c = ctx();
-        const evt = c.eventTypes ?? {};
-        c.eventSource.on(evt.CHAT_COMPLETION_PROMPT_READY ?? 'chat_completion_prompt_ready', data => {
-            try {
-                if (!Array.isArray(data?.chat)) return;
-                const r = stabilize(data.chat, !!data.dryRun);
-                if (!data.dryRun) {
-                    // 宿主（如 TauriTavern）可能把请求藏在自己的进程里，拦不到 fetch；
-                    // 用事件里这份已经改好的提示词兜底，保证"两轮对比"照样有数据
-                    try { noteSent(data.chat.map(m => `[${m.role}]${text(m)}`)); } catch { /* 忽略 */ }
-                    if (r.skipped === 'single') {
-                        state.lastRun = '⚠ 开头的 system 消息只有 1 块（多半开了「合并系统消息」或提示词后处理），无法逐块冻结';
-                    } else if (r.skipped === 'empty') {
-                        state.lastRun = '⚠ 开头没有 system 消息（「使用系统提示」可能关着），无法冻结前缀';
-                    }
-                    render();
-                }
-            } catch (e) {
-                console.error('[缓存优化] 冻结失败（已跳过，不影响生成）', e);
-            }
-        });
-        console.info(`[缓存优化] v${VERSION} 已加载`);
-    } catch (e) {
-        console.error('[缓存优化] 初始化失败', e);
+    settings();
+
+    // 不再展示旧版持久化的请求比较结论。
+    if ('lastRealReport' in settings()) {
+        delete settings().lastRealReport;
+        save();
     }
+
+    renderSettings();
+    watchRealRequests();
+
+    const c = ctx();
+
+    c.eventSource.on(c.eventTypes.WORLDINFO_ENTRIES_LOADED, data => {
+        routeEntries([
+            data?.globalLore,
+            data?.characterLore,
+            data?.chatLore,
+            data?.personaLore,
+        ]);
+    });
+
+    c.eventSource.on(
+        c.eventTypes.CHAT_COMPLETION_PROMPT_READY,
+        onPromptReady,
+    );
 });
