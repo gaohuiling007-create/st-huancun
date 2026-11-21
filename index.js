@@ -1,4 +1,4 @@
-// ST-Cache-Optimizer 2.4.4
+// ST-Cache-Optimizer 2.4.5
 //
 // 只调整当前请求中的提示词，不修改世界书文件。
 // 请求诊断观察浏览器 -> 酒馆后端的消息及响应副本。
@@ -181,7 +181,7 @@ function routeEntries(lists) {
     const afterOk = presetSlotBeforeHistory('worldInfoAfter');
     const stickyOn = s.stickyLore && !systemBlocksGetMerged();
     const stickyTurns = Math.max(
-        1, Math.floor(Number(s.stickyTurns) || DEFAULTS.stickyTurns),
+        1, Math.min(50, Math.floor(Number(s.stickyTurns) || DEFAULTS.stickyTurns)),
     );
 
     let moved = null;
@@ -366,95 +366,98 @@ function normalize(value) {
     return String(value ?? '').replace(/\s+/g, ' ').trim();
 }
 
-function historySnippets() {
-    return (ctx().chat ?? [])
-        .filter(message => message && !message.is_system
-            && typeof message.mes === 'string'
-            && message.mes.trim())
-        .slice(-60)
-        .map(message => {
-            const value = normalize(message.mes);
-            if (value.length <= 60) return [value];
+function historyText(value) {
+    return normalize(value).replace(/^"([\s\S]*)"$/, '$1');
+}
 
-            return [0.3, 0.5, 0.7].map(position => {
-                const start = Math.floor(value.length * position);
-                return value.slice(start, start + 30);
-            });
-        });
+function matchesHistory(source, target) {
+    if (source.role !== target.role) return false;
+    if (source.value === target.value) return true;
+    // 扩展可能包裹或局部改写正文。短消息只允许完整匹配。
+    if (source.value.length < 90) return false;
+    const first = Math.floor(source.value.length * 0.25);
+    const second = Math.floor(source.value.length * 0.65);
+    const at = target.value.indexOf(source.value.slice(first, first + 24));
+    return at >= 0 && target.value.includes(source.value.slice(second, second + 24), at + 24);
 }
 
 function findHistoryRange(chat) {
-    const snippets = historySnippets();
-    if (!snippets.length) return null;
+    const turns = [];
+    for (const [index, message] of chat.entries()) {
+        if (!['user', 'assistant'].includes(message?.role)) continue;
+        const value = historyText(text(message));
+        if (value) turns.push({ index, role: message.role, value });
+    }
 
-    let start = -1;
-    let end = -1;
+    const local = ctx().chat ?? [];
+    const history = [];
+    for (let i = local.length - 1; i >= 0 && history.length <= turns.length; i--) {
+        const message = local[i];
+        if (message?.is_system || typeof message?.mes !== 'string') continue;
+        const value = historyText(message.mes);
+        if (value) history.push({ role: message.is_user ? 'user' : 'assistant', value });
+    }
+    history.reverse();
 
-    chat.forEach((message, index) => {
-        if (message.role === 'system') return;
-
-        const value = normalize(text(message));
-
-        if (value && snippets.some(parts =>
-            parts.some(part => part && value.includes(part)))) {
-            if (start < 0) start = index;
-            end = index;
+    // 组装可能裁掉旧历史，或在末尾追加本地尚未保存的新输入。
+    // 从末尾找同角色、同顺序的连续匹配，遇到不一致即停止向前扩展。
+    let best = null;
+    for (const offset of [0, 1]) {
+        const last = history.length - 1 - offset;
+        if (last < 0) continue;
+        for (let end = turns.length - 1; end >= 0; end--) {
+            if (!matchesHistory(history[last], turns[end])) continue;
+            let count = 1;
+            while (last >= count && end >= count
+                && matchesHistory(history[last - count], turns[end - count])) count++;
+            if (!best || count > best.count) {
+                best = { start: turns[end - count + 1].index, end: turns[end].index, count };
+            }
+            // 优先采用最近的匹配，避免把前面的示例对话当作历史。
+            break;
         }
-    });
-
-    return start < 0 ? null : { start, end };
+    }
+    if (!best || best.count < 2) return null;
+    return best;
 }
 
-function canMoveSystem(message) {
+function canMoveSystem(message, keep) {
     // 工具调用、多模态内容和保持原位的规则不参与重排。
     return message?.role === 'system'
         && typeof message.content === 'string'
         && !message.tool_calls
         && !message.tool_call_id
         && !isTopBlock(message)
-        && !keepRegex().test(headOf(message));
+        && !keep.test(headOf(message));
 }
 
-function reorder(chat) {
-    const range = findHistoryRange(chat);
-    const start = range?.start
-        ?? chat.findIndex(message => message.role !== 'system');
-    const end = range?.end
-        ?? chat.findLastIndex(message => message.role === 'user');
+function reorder(chat, range, keep) {
+    if (!range) return 0;
+    const { start, end } = range;
+    // 工具结果、模型签名和多模态消息可能依赖原来的相邻关系。
+    if (chat.some(message => message?.role === 'tool' || message?.tool_calls
+        || message?.tool_call_id || message?.signature || Array.isArray(message?.content))) return 0;
 
-    if (start < 0 || end < 0) return 0;
-
-    const anchor = chat[end];
     const moved = [];
-
-    for (let i = end - 1; i > start; i--) {
-        if (canMoveSystem(chat[i])) {
-            moved.unshift(...chat.splice(i, 1));
+    let write = 0;
+    for (let i = 0; i <= end; i++) {
+        const message = chat[i];
+        const early = i < start;
+        if (i < end && i !== start && canMoveSystem(message, keep)
+            && (!early || (isVolatileHead(headOf(message)) && message.content.length <= MAX_LEARN_CHARS)
+                || message.content.trimStart().startsWith(WRAP_OPEN))) {
+            moved.push(message);
+        } else {
+            chat[write++] = message;
         }
     }
-
-    for (let i = start - 1; i >= 0; i--) {
-        const value = text(chat[i]).trimStart();
-
-        if (canMoveSystem(chat[i])
-            && ((isVolatileHead(headOf(chat[i]))
-                && value.length <= MAX_LEARN_CHARS)
-                || value.startsWith(WRAP_OPEN))) {
-            moved.unshift(...chat.splice(i, 1));
-        }
-    }
-
-    if (moved.length) {
-        const at = chat.indexOf(anchor);
-        chat.splice(range ? at + 1 : at, 0, ...moved);
-    }
-
+    for (const message of moved) chat[write++] = message;
     return moved.length;
 }
 
-function learnFrom(chat) {
+function learnFrom(chat, range, keep) {
     const s = settings();
-    if (!s.learn) return [];
+    if (!s.learn || !range) return [];
 
     const currentChat = chatId();
 
@@ -463,17 +466,15 @@ function learnFrom(chat) {
         changeCounts.clear();
     }
 
-    const range = findHistoryRange(chat);
-    const firstTurn = chat.findIndex(message => message.role !== 'system');
-    const stop = range?.start
-        ?? (firstTurn < 0 ? chat.length : firstTurn);
-
-    const blocks = chat.slice(0, stop)
-        .filter(canMoveSystem)
-        .map(message => ({
-            head: headOf(message),
-            body: text(message),
-        }));
+    const firstTurn = chat.findIndex(message => message?.role !== 'system');
+    const blocks = chat.slice(0, firstTurn < 0 ? range.start : firstTurn)
+        .filter(message => canMoveSystem(message, keep)
+            && message.content.length <= MAX_LEARN_CHARS)
+        .map(message => ({ head: headOf(message), body: message.content }));
+    const currentHeads = new Set(blocks.map(block => block.head));
+    for (const head of changeCounts.keys()) {
+        if (!currentHeads.has(head)) changeCounts.delete(head);
+    }
 
     const learned = [];
 
@@ -526,10 +527,12 @@ function learnFrom(chat) {
 function onPromptReady(data) {
     if (!settings().enabled || !Array.isArray(data?.chat)) return;
 
-    const count = reorder(data.chat);
-    if (data.dryRun || checking) return;
-
-    const learned = learnFrom(data.chat);
+    const range = findHistoryRange(data.chat);
+    const keep = keepRegex();
+    const simulated = data.dryRun || checking;
+    const learned = simulated ? [] : learnFrom(data.chat, range, keep);
+    const count = reorder(data.chat, range, keep);
+    if (simulated) return;
 
     lastRun = `${new Date().toLocaleTimeString()} 重排：移动 ${count} 个块`
         + (learned.length
@@ -566,7 +569,7 @@ async function captureDryRun() {
     let captured = null;
 
     const handler = data => {
-        if (Array.isArray(data?.chat)) {
+        if (data?.dryRun === true && Array.isArray(data.chat)) {
             captured = structuredClone(data.chat);
         }
     };
@@ -596,31 +599,55 @@ async function checkStability() {
         return;
     }
 
-    const lastUser = c.chat.findLastIndex(message => message.is_user);
+    const history = c.chat;
+    const lastUser = history.findLastIndex(message => message?.is_user && !message.is_system);
+    const previousUser = history.findLastIndex((message, i) => i < lastUser
+        && message?.is_user && !message.is_system);
 
-    if (lastUser < 2) {
-        report.text('聊天记录太短，至少需要两轮对话。');
+    if (previousUser < 0) {
+        report.text('聊天记录太短，至少需要两条用户消息。');
+        return;
+    }
+    if ($('#mes_stop').is(':visible')) {
+        report.text('当前正在生成，请等回复完成后再检查。');
         return;
     }
 
     checking = true;
-    $('#cacheopt_check').attr('aria-disabled', 'true');
+    $('#cacheopt_check').prop('disabled', true);
     report.text('模拟检查中，不调用模型。请等待完成后再操作聊天。');
 
-    try {
-        let previous;
-
-        // 与原版相同，通过临时截短内存聊天模拟上一轮。
-        // 无论组装成功与否，都恢复被移除的消息。
-        const removed = c.chat.splice(lastUser - 1);
-
+    const startingChatId = chatId();
+    const sameChat = () => ctx().chat === history && chatId() === startingChatId;
+    const captureThrough = async userIndex => {
+        // 两次都保留该轮用户输入，仅截去后续消息。
+        const boundary = userIndex + 1;
+        const removed = history.splice(boundary);
         try {
-            previous = await captureDryRun();
+            return await captureDryRun();
         } finally {
-            c.chat.push(...removed);
+            // 避免向切换后的会话或已重载的历史写回旧消息。
+            if (sameChat()) {
+                for (const [offset, message] of removed.entries()) {
+                    history.splice(boundary + offset, 0, message);
+                }
+            } else if (ctx().chat !== history) {
+                for (const message of removed) history.push(message);
+            }
         }
+    };
 
-        const current = await captureDryRun();
+    try {
+        const previous = await captureThrough(previousUser);
+        if (!sameChat()) {
+            report.text('检查期间切换了聊天，请在当前聊天重新检查。');
+            return;
+        }
+        const current = await captureThrough(lastUser);
+        if (!sameChat()) {
+            report.text('检查期间切换了聊天，请在当前聊天重新检查。');
+            return;
+        }
 
         if (!previous || !current) {
             report.text('检查失败：没有捕获到组装后的提示词。');
@@ -662,7 +689,7 @@ async function checkStability() {
         ].join('\n'));
     } finally {
         checking = false;
-        $('#cacheopt_check').removeAttr('aria-disabled');
+        $('#cacheopt_check').prop('disabled', false);
     }
 }
 
@@ -802,6 +829,7 @@ function recordRealRequest(rawBody) {
     );
 
     latestReal = cur;
+    publishUsage(cur, '等待本次响应的缓存用量。');
     recentReal.push(cur);
     recentReal = recentReal.slice(-RECENT_LIMIT);
 
@@ -834,6 +862,8 @@ function readUsage(value, state) {
 
         if (validCount(count)) {
             state.cached = count;
+            const total = google.promptTokenCount ?? google.prompt_token_count;
+            state.total = validCount(total) ? total : null;
             state.field = 'usageMetadata.cachedContentTokenCount';
         }
     }
@@ -848,6 +878,8 @@ function readUsage(value, state) {
 
         if (validCount(count)) {
             state.cached = count;
+            const total = usage.prompt_tokens ?? usage.input_tokens;
+            state.total = validCount(total) ? total : null;
             state.field = 'usage.*_tokens_details.cached_tokens';
         }
     }
@@ -862,7 +894,7 @@ function readUsage(value, state) {
 
 function publishUsage(cur, message) {
     // 清空诊断后，忽略仍在完成的旧请求。
-    if (!recentReal.includes(cur)) return;
+    if (latestReal !== cur) return;
 
     lastUsageReport = [
         `${new Date(cur.at).toLocaleTimeString()} 发出的请求`,
@@ -979,13 +1011,15 @@ async function observeRealResponse(copy, cur) {
             : '\n诊断读取未完成，用量可能不完整。';
 
         if (state.cached !== null) {
+            const ratio = state.total > 0 && state.cached <= state.total
+                ? `\n输入缓存比例：${(state.cached / state.total * 100).toFixed(1)}%（${state.cached.toLocaleString()} / ${state.total.toLocaleString()} tokens）`
+                : '';
             publishUsage(
                 cur,
                 (state.cached > 0
-                    ? `✅ 响应报告缓存命中：${state.cached.toLocaleString()} tokens`
+                    ? `响应报告缓存命中：${state.cached.toLocaleString()} tokens`
                     : '响应明确报告缓存为 0')
-                    + `\n字段：${state.field}`
-                    + suffix,
+                    + ratio + `\n字段：${state.field}` + suffix,
             );
         } else {
             publishUsage(
@@ -1035,8 +1069,9 @@ function watchRealRequests() {
                     ? input.href
                     : input?.url;
 
-            watched = !!url
-                && new URL(url, location.href).pathname === GENERATE_PATH;
+            const target = url ? new URL(url, location.href) : null;
+            watched = target?.origin === location.origin
+                && target.pathname === GENERATE_PATH;
 
             if (watched) {
                 if (typeof init?.body === 'string') {
@@ -1156,7 +1191,7 @@ function renderSettings() {
     <div class="cacheopt-settings">
       <div class="inline-drawer">
         <div class="inline-drawer-toggle inline-drawer-header">
-          <b>⚡ 缓存优化 2.4.4</b>
+          <b>⚡ 缓存优化 2.4.5</b>
           <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
         </div>
 
@@ -1222,7 +1257,7 @@ function renderSettings() {
           <div id="cacheopt_real" class="cacheopt-report">等待新的真实请求。</div>
 
           <div class="cacheopt-hint">
-            最近完成的响应诊断：
+            最新请求的响应诊断：
           </div>
           <div id="cacheopt_usage" class="cacheopt-report"></div>
 
