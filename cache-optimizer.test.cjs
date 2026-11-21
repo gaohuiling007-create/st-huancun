@@ -9,7 +9,7 @@ const user = content => ({ role: 'user', content });
 const assistant = content => ({ role: 'assistant', content });
 const system = content => ({ role: 'system', content });
 
-function load(history) {
+function load(history, host = {}) {
     let id = 'chat-a';
     const ui = new Map();
     const context = {
@@ -20,15 +20,65 @@ function load(history) {
     };
     const sandbox = vm.createContext({
         SillyTavern: { getContext: () => context }, jQuery() {},
-        structuredClone, TextDecoder,
+        structuredClone, TextDecoder, URL, Request, ...host,
         $: selector => ({ text: value => ui.set(selector, value), prop() {}, is: () => false }),
     });
     const api = vm.runInContext(source + `\n({ onPromptReady, settings, checkStability,
-        recordRealRequest, observeRealResponse, captureDryRun, sharedPrefix, stableJSON })`, sandbox);
+        recordRealRequest, observeRealResponse, captureDryRun, sharedPrefix, stableJSON,
+        watchRealRequests, initialize })`, sandbox);
     return { ...api, context, ui, switchChat: next => { id = next; } };
 }
 
 const history = [user('你好'), assistant('这是上一轮真实回复。'), user('继续探索')];
+
+test('TauriTavern 等待宿主就绪，且免费检查不截短窗口化聊天', async () => {
+    let ready;
+    let mountChecked = false;
+    const window = { __TAURITAVERN__: { ready: new Promise(resolve => { ready = resolve; }) } };
+    const document = { querySelector() { mountChecked = true; return {}; } };
+    const { initialize, checkStability, settings, context } = load(history, { window, document, structuredClone: undefined });
+    const originalHistory = [...context.chat];
+    const initializing = initialize();
+    assert.equal(mountChecked, false);
+    assert.equal(settings().enabled, true);
+    context.generate = () => assert.fail('窗口化历史不应执行免费组装');
+    await checkStability();
+    assert.deepEqual(context.chat, originalHistory);
+    ready();
+    await initializing;
+    assert.equal(mountChecked, true);
+});
+
+test('iOS 自定义协议捕获宿主生成请求，跳过同路径不同主机', async () => {
+    const endpoint = '/api/backends/chat-completions/generate';
+    const window = { location: { href: 'tauri://localhost/index.html', origin: 'null' } };
+    let forwarded = 0;
+    window.fetch = () => {
+        forwarded++;
+        return Promise.resolve(new Response(JSON.stringify({ usage: { prompt_tokens: 500, cached_tokens: 100 } })));
+    };
+    const { watchRealRequests, ui } = load(history, { window });
+    watchRealRequests();
+    const init = { method: 'POST', body: JSON.stringify({ messages: history }) };
+    await window.fetch(`tauri://elsewhere${endpoint}`, init);
+    assert.equal(ui.has('#cacheopt_real'), false);
+    const response = await window.fetch(endpoint, init);
+    assert.equal((await response.json()).usage.cached_tokens, 100);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.match(ui.get('#cacheopt_usage'), /20\.0%/);
+    await window.fetch(endpoint, init);
+    assert.match(ui.get('#cacheopt_real'), /100\.0%/);
+    assert.equal(forwarded, 3);
+});
+
+test('TauriTavern 转发的 Claude 流式数据计入缓存写入和读取', async () => {
+    const { recordRealRequest, observeRealResponse, ui } = load(history);
+    const cur = recordRealRequest(JSON.stringify({ stream: true, messages: history }));
+    const usage = { input_tokens: 100, cache_creation_input_tokens: 200, cache_read_input_tokens: 700 };
+    const event = { type: 'message_start', message: { usage } };
+    await observeRealResponse(new Response(`data: ${JSON.stringify(event)}\n\ndata: [DONE]\n\n`), cur);
+    assert.match(ui.get('#cacheopt_usage'), /70\.0%/);
+});
 
 test('示例里的短句及其中的规则不参与真实历史重排', () => {
     const { onPromptReady } = load(history);

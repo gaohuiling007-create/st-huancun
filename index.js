@@ -1,4 +1,4 @@
-// ST-Cache-Optimizer 2.4.5
+// ST-Cache-Optimizer 2.4.6
 //
 // 只调整当前请求中的提示词，不修改世界书文件。
 // 请求诊断观察浏览器 -> 酒馆后端的消息及响应副本。
@@ -65,12 +65,20 @@ function ctx() {
     return SillyTavern.getContext();
 }
 
+function tauriReady() {
+    return window.__TAURITAVERN__?.ready ?? window.__TAURITAVERN_MAIN_READY__;
+}
+
+function isTauriTavern() {
+    return typeof window !== 'undefined' && Boolean(window.__TAURITAVERN__ || tauriReady());
+}
+
 function settings() {
     const all = ctx().extensionSettings;
-    all[MODULE] ??= structuredClone(DEFAULTS);
+    all[MODULE] ??= {};
 
     for (const [key, value] of Object.entries(DEFAULTS)) {
-        all[MODULE][key] ??= structuredClone(value);
+        all[MODULE][key] ??= Array.isArray(value) ? [...value] : value;
     }
 
     if (!Array.isArray(all[MODULE].volatileHeads)) {
@@ -589,7 +597,7 @@ async function captureDryRun() {
 }
 
 async function checkStability() {
-    if (checking) return;
+    if (checking || isTauriTavern()) return;
 
     const c = ctx();
     const report = $('#cacheopt_report');
@@ -873,19 +881,30 @@ function readUsage(value, state) {
     if (usage && typeof usage === 'object') {
         state.sawUsage = true;
 
-        const count = usage.prompt_tokens_details?.cached_tokens
-            ?? usage.input_tokens_details?.cached_tokens;
-
-        if (validCount(count)) {
+        const fields = [
+            ['prompt_tokens_details.cached_tokens', usage.prompt_tokens_details?.cached_tokens],
+            ['input_tokens_details.cached_tokens', usage.input_tokens_details?.cached_tokens],
+            ['cached_tokens', usage.cached_tokens],
+            ['prompt_cache_hit_tokens', usage.prompt_cache_hit_tokens],
+            ['cache_read_input_tokens', usage.cache_read_input_tokens],
+            ['cachedContentTokenCount', usage.cachedContentTokenCount],
+        ];
+        const hit = fields.find(([, count]) => validCount(count));
+        if (hit) {
+            const [field, count] = hit;
+            let total = usage.prompt_tokens ?? usage.promptTokenCount ?? usage.input_tokens;
+            // Claude 的原始 input_tokens 不含缓存读取和写入。
+            if (field === 'cache_read_input_tokens' && usage.prompt_tokens == null && validCount(usage.input_tokens)) {
+                total = usage.input_tokens + (usage.cache_creation_input_tokens ?? 0) + count;
+            }
             state.cached = count;
-            const total = usage.prompt_tokens ?? usage.input_tokens;
             state.total = validCount(total) ? total : null;
-            state.field = 'usage.*_tokens_details.cached_tokens';
+            state.field = `usage.${field}`;
         }
     }
 
     // 部分中转将响应包在这些字段中。
-    for (const key of ['data', 'response', 'result']) {
+    for (const key of ['data', 'response', 'result', ...(value.type === 'message_start' ? ['message'] : [])]) {
         if (value[key] && typeof value[key] === 'object') {
             readUsage(value[key], state);
         }
@@ -1069,8 +1088,10 @@ function watchRealRequests() {
                     ? input.href
                     : input?.url;
 
-            const target = url ? new URL(url, location.href) : null;
-            watched = target?.origin === location.origin
+            const page = new URL(window.location.href);
+            const target = url ? new URL(url, page) : null;
+            // iOS WebView 的自定义协议可能返回字符串 'null' 作为 origin。
+            watched = target?.protocol === page.protocol && target.host === page.host
                 && target.pathname === GENERATE_PATH;
 
             if (watched) {
@@ -1191,7 +1212,7 @@ function renderSettings() {
     <div class="cacheopt-settings">
       <div class="inline-drawer">
         <div class="inline-drawer-toggle inline-drawer-header">
-          <b>⚡ 缓存优化 2.4.5</b>
+          <b>⚡ 缓存优化 2.4.6</b>
           <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
         </div>
 
@@ -1234,9 +1255,9 @@ function renderSettings() {
           </label>
 
           <div class="cacheopt-row">
-            <button id="cacheopt_check" type="button" class="menu_button">
+            ${isTauriTavern() ? '' : `<button id="cacheopt_check" type="button" class="menu_button">
               检查提示词稳定性（免费）
-            </button>
+            </button>`}
             <button id="cacheopt_forget" type="button" class="menu_button">
               清空已学到的易变块
             </button>
@@ -1248,7 +1269,9 @@ function renderSettings() {
           <div id="cacheopt_learned" class="cacheopt-hint"></div>
           <div id="cacheopt_last" class="cacheopt-hint"></div>
 
-          <div id="cacheopt_report" class="cacheopt-report">免费检查比较消息字符前缀，不代表实际缓存命中率。</div>
+          <div id="cacheopt_report" class="cacheopt-report">${isTauriTavern()
+            ? 'TauriTavern 使用真实请求对比。请在同一聊天和模型下连续生成两轮。'
+            : '免费检查比较消息字符前缀，不代表实际缓存命中率。'}</div>
 
           <div class="cacheopt-hint">
             真实请求对比：按聊天、接口、模型和请求用途分组，
@@ -1360,7 +1383,9 @@ function renderSettings() {
     setEnabled(settings().enabled);
 }
 
-jQuery(() => {
+async function initialize() {
+    if (isTauriTavern()) await tauriReady();
+    if (document.querySelector('.cacheopt-settings')) return;
     settings();
 
     // 不再展示旧版持久化的请求比较结论。
@@ -1387,4 +1412,8 @@ jQuery(() => {
         c.eventTypes.CHAT_COMPLETION_PROMPT_READY,
         onPromptReady,
     );
+}
+
+jQuery(() => {
+    initialize().catch(error => console.error('[Cache Optimizer] 初始化失败', error));
 });
