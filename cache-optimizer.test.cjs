@@ -89,12 +89,20 @@ test('示例里的短句及其中的规则不参与真实历史重排', () => {
     assert.deepEqual(chat, [system('固定规则'), ...example, ...history, variable, system('尾部格式')]);
 });
 
-test('缺乏连续历史依据时保留顺序', () => {
+test('缺乏连续历史依据时不动没标记过的块', () => {
     const { onPromptReady } = load(history);
-    const chat = [system('〔记忆系统私密简报\n变化'), user('继续探索'), system('示例规则'), assistant('不同的回复')];
+    const chat = [system('普通规则'), user('继续探索'), system('示例规则'), assistant('不同的回复')];
     const original = [...chat];
     onPromptReady({ chat });
     assert.deepEqual(chat, original);
+});
+
+test('认不出历史范围时，已确认的易变块仍会挪到最后', () => {
+    const { onPromptReady } = load(history);
+    const volatileBlock = system('〔记忆系统私密简报\n这一轮的内容');
+    const chat = [volatileBlock, system('普通规则'), user('继续探索'), assistant('不同的回复')];
+    onPromptReady({ chat });
+    assert.deepEqual(chat, [system('普通规则'), user('继续探索'), assistant('不同的回复'), volatileBlock]);
 });
 
 test('历史裁剪后仍可识别尾部，按原顺序集中动态块并延长共同前缀', () => {
@@ -123,19 +131,76 @@ test('工具链、多模态、模型签名分别保留顺序', () => {
     }
 });
 
-test('已知易变块立即后移，自动学习在第二次观察到变化时生效', () => {
+test('已知易变块立即后移，内容变化在第二次观察到时生效', () => {
     const { onPromptReady, settings } = load(history);
     const known = system('〔记忆系统私密简报\n已知');
     const withKnown = [known, ...history];
     onPromptReady({ chat: withKnown });
     assert.equal(withKnown.at(-1), known);
-    for (let i = 0; i <= 2; i++) {
+
+    const stable = system('固定规则');
+    const fresh = load(history);
+    fresh.onPromptReady({ chat: [stable, system('剧情状态记录\n版本 0'), ...history] });
+
+    for (let i = 1; i <= 2; i++) {
         const dynamic = system(`剧情状态记录\n版本 ${i}`);
-        const chat = [system('固定规则'), dynamic, ...history];
+        const chat = [stable, dynamic, ...history];
+        fresh.onPromptReady({ chat });
+        assert.equal(chat.indexOf(dynamic), i < 2 ? 1 : chat.length - 1);
+    }
+    assert.equal(fresh.settings().learnedHeads.at(-1), '剧情状态记录 版本 #');
+});
+
+test('第一行带序号的状态块仍被认作同一块，学习后立即后移', () => {
+    const { onPromptReady, settings } = load(history);
+    const stable = system('固定规则');
+    onPromptReady({ chat: [stable, system('第 0 轮记录\n当前状态 0'), ...history] });
+    for (let i = 1; i <= 2; i++) {
+        const dynamic = system(`第 ${i} 轮记录\n当前状态 ${i}`);
+        const chat = [stable, dynamic, ...history];
         onPromptReady({ chat });
         assert.equal(chat.indexOf(dynamic), i < 2 ? 1 : chat.length - 1);
     }
-    assert.equal(settings().learnedHeads[0], '剧情状态记录');
+    assert.equal(settings().learnedHeads.at(-1), '第 # 轮记录 当前状态 #');
+});
+
+test('时有时无的系统块被认出来后固定在尾部', () => {
+    const { onPromptReady, settings } = load(history);
+    const stable = system('固定规则');
+    const sometimes = system('偶尔命中的世界书条目');
+
+    onPromptReady({ chat: [stable, sometimes, ...history] });
+    onPromptReady({ chat: [stable, ...history] });
+    assert.ok(settings().learnedHeads.includes('偶尔命中的世界书条目'));
+
+    const chat = [stable, sometimes, ...history];
+    onPromptReady({ chat });
+    assert.equal(chat.at(-1), sometimes);
+});
+
+test('真实请求对比指出断点所在块与前后原文', () => {
+    const { recordRealRequest, ui } = load(history);
+    recordRealRequest(JSON.stringify({ model: 'mock', messages: [
+        system('固定规则，每次都一样'), user('你好'),
+    ] }));
+    recordRealRequest(JSON.stringify({ model: 'mock', messages: [
+        system('固定规则，第 2 次不同'), user('你好'),
+    ] }));
+    const report = ui.get('#cacheopt_real');
+    assert.match(report, /变化所在块开头：固定规则，每次都一样/);
+    assert.match(report, /原文：…固定规则，每次都一样…/);
+    assert.match(report, /现文：…固定规则，第 2 次不同…/);
+    assert.match(report, /还没标记为易变/);
+    assert.match(report, /相同前缀估算：约 0 tokens/);
+});
+
+test('聊天记录被改写时提示窗口或历史变化', () => {
+    const { recordRealRequest, ui } = load(history);
+    recordRealRequest(JSON.stringify({ model: 'mock', messages: history }));
+    recordRealRequest(JSON.stringify({ model: 'mock', messages: [
+        user('换了一段完全不同的开头'), ...history.slice(1),
+    ] }));
+    assert.match(ui.get('#cacheopt_real'), /变化落在聊天记录里/);
 });
 
 test('免费检查保留两轮各自的用户输入并恢复完整历史', async () => {
@@ -183,6 +248,28 @@ test('流式兼容响应上报的 token 用量可计算缓存比例', async () =
     const sse = 'data: {"usage":{"prompt_tokens":400,"prompt_tokens_details":{"cached_tokens":100}}}\r\n\r\ndata: [DONE]\r\n\r\n';
     await observeRealResponse(new Response(sse, { headers: { 'Content-Type': 'text/event-stream' } }), cur);
     assert.match(ui.get('#cacheopt_usage'), /25\.0%/);
+});
+
+test('报告零命中时按前缀形状给出不同结论', async () => {
+    const { recordRealRequest, observeRealResponse, ui } = load(history);
+    const body = messages => JSON.stringify({ model: 'mock', messages });
+    const first = recordRealRequest(body(history));
+    await observeRealResponse(new Response(JSON.stringify({ usage: {
+        prompt_tokens: 900, prompt_tokens_details: { cached_tokens: 0 },
+    } })), first);
+    assert.match(ui.get('#cacheopt_usage'), /响应明确报告缓存为 0/);
+
+    const same = recordRealRequest(body(history));
+    await observeRealResponse(new Response(JSON.stringify({ usage: {
+        prompt_tokens: 900, prompt_tokens_details: { cached_tokens: 0 },
+    } })), same);
+    assert.match(ui.get('#cacheopt_usage'), /上游或中转没有启用提示词缓存/);
+
+    const grown = recordRealRequest(body([...history, assistant('新的回复'), user('再问一句')]));
+    await observeRealResponse(new Response(JSON.stringify({ usage: {
+        prompt_tokens: 900, prompt_tokens_details: { cached_tokens: 0 },
+    } })), grown);
+    assert.match(ui.get('#cacheopt_usage'), /内容只在末尾追加/);
 });
 
 test('真实响应中的输入缓存比例可见，较早请求不能覆盖新报告', async () => {

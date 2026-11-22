@@ -1,4 +1,4 @@
-// ST-Cache-Optimizer 2.4.6
+// ST-Cache-Optimizer 2.5.0
 //
 // 只调整当前请求中的提示词，不修改世界书文件。
 // 请求诊断观察浏览器 -> 酒馆后端的消息及响应副本。
@@ -30,8 +30,18 @@ const STICKY_CLOSE = '</近期剧情设定>';
 const TOP_DEPTH = 10000;
 const STICKY_ORDER_BASE = 2000000;
 const HOIST_ORDER_BASE = 100000;
-const MAX_LEARNED = 30;
+const MAX_LEARNED = 40;
 const MAX_LEARN_CHARS = 20000;
+// 多数模型要求可缓存前缀达到约 1k tokens 才开始命中。
+const MIN_CACHE_TOKENS = 1024;
+const KEY_CHARS = 28;
+
+// 服务端报告 0 命中时，按前缀形状给出不同结论，避免“没提升”变成猜谜。
+const ZERO_HINTS = {
+    identical: '两次请求内容完全相同仍报 0：多半是上游或中转没有启用提示词缓存。',
+    append: '内容只在末尾追加，理论上应命中：确认模型支持缓存、前缀达到门槛，且两次间隔在缓存有效期内。',
+    partial: '前缀在中途断开：看上方「真实请求对比」里的首个变化位置。',
+};
 
 const POS = {
     before: 0,
@@ -358,16 +368,28 @@ function headOf(message) {
     return text(message).trimStart().split('\n', 1)[0].slice(0, 40);
 }
 
+// 用来认出「同一个块」。第一行里的数字、书名号、引号每轮都可能变，
+// 去掉这些之后仍相同，才视为同一块，才能观察它是否真的在变。
+function blockKey(value) {
+    return normalize(String(value ?? '').slice(0, 600))
+        .replace(/[0-9０-９]+/g, '#')
+        .replace(/[「」『』〔〕【】《》〈〉"“”'‘’`]/g, '')
+        .slice(0, KEY_CHARS);
+}
+
 function isTopBlock(message) {
     const value = text(message).trimStart();
     return value.startsWith(STATIC_OPEN)
         || value.startsWith(STICKY_OPEN);
 }
 
-function isVolatileHead(head) {
+function isVolatileHead(value) {
+    const head = normalize(value).slice(0, 80);
+    const key = blockKey(value);
     const s = settings();
+
     return [...s.volatileHeads, ...s.learnedHeads]
-        .some(value => value && head.startsWith(value));
+        .some(item => item && (head.startsWith(item) || key === item));
 }
 
 function normalize(value) {
@@ -439,12 +461,39 @@ function canMoveSystem(message, keep) {
         && !keep.test(headOf(message));
 }
 
+function isMovableVolatile(message, keep) {
+    return canMoveSystem(message, keep)
+        && message.content.length <= MAX_LEARN_CHARS
+        && (isVolatileHead(message.content)
+            || message.content.trimStart().startsWith(WRAP_OPEN));
+}
+
+// 认不出聊天记录范围时不做猜测，只把已确认的易变块挪到最后。
+function reorderFallback(chat, keep) {
+    const moved = [];
+    const kept = [];
+
+    for (const message of chat) {
+        (isMovableVolatile(message, keep) ? moved : kept).push(message);
+    }
+
+    if (!moved.length) return 0;
+
+    const next = [...kept, ...moved];
+    if (next.every((message, index) => message === chat[index])) return 0;
+
+    chat.length = 0;
+    chat.push(...next);
+    return moved.length;
+}
+
 function reorder(chat, range, keep) {
-    if (!range) return 0;
-    const { start, end } = range;
-    // 工具结果、模型签名和多模态消息可能依赖原来的相邻关系。
     if (chat.some(message => message?.role === 'tool' || message?.tool_calls
         || message?.tool_call_id || message?.signature || Array.isArray(message?.content))) return 0;
+
+    if (!range) return reorderFallback(chat, keep);
+
+    const { start, end } = range;
 
     const moved = [];
     let write = 0;
@@ -452,8 +501,7 @@ function reorder(chat, range, keep) {
         const message = chat[i];
         const early = i < start;
         if (i < end && i !== start && canMoveSystem(message, keep)
-            && (!early || (isVolatileHead(headOf(message)) && message.content.length <= MAX_LEARN_CHARS)
-                || message.content.trimStart().startsWith(WRAP_OPEN))) {
+            && (!early || isMovableVolatile(message, keep))) {
             moved.push(message);
         } else {
             chat[write++] = message;
@@ -475,57 +523,68 @@ function learnFrom(chat, range, keep) {
     }
 
     const firstTurn = chat.findIndex(message => message?.role !== 'system');
-    const blocks = chat.slice(0, firstTurn < 0 ? range.start : firstTurn)
-        .filter(message => canMoveSystem(message, keep)
-            && message.content.length <= MAX_LEARN_CHARS)
-        .map(message => ({ head: headOf(message), body: message.content }));
-    const currentHeads = new Set(blocks.map(block => block.head));
-    for (const head of changeCounts.keys()) {
-        if (!currentHeads.has(head)) changeCounts.delete(head);
+    const stop = firstTurn < 0 ? range.start : firstTurn;
+
+    // 同名块只取第一次出现，重复内容不算变化。
+    const blocks = [];
+    const seen = new Set();
+
+    for (const message of chat.slice(0, stop)) {
+        if (!canMoveSystem(message, keep)) continue;
+        if (message.content.length > MAX_LEARN_CHARS) continue;
+
+        const key = blockKey(message.content);
+        if (!key || seen.has(key)) continue;
+
+        seen.add(key);
+        blocks.push({ key, body: message.content });
+    }
+
+    const currentKeys = new Set(blocks.map(block => block.key));
+    for (const key of changeCounts.keys()) {
+        if (!currentKeys.has(key)) changeCounts.delete(key);
     }
 
     const learned = [];
+    const remember = key => {
+        if (!key || s.learnedHeads.includes(key) || isVolatileHead(key)) {
+            return false;
+        }
+
+        s.learnedHeads.push(key);
+        learned.push(key);
+        return true;
+    };
 
     if (lastSystemBlocks?.chatId === currentChat) {
-        const previous = new Map();
-        const duplicates = new Set();
-        const currentCounts = new Map();
+        const previous = new Map(
+            lastSystemBlocks.blocks.map(block => [block.key, block.body]),
+        );
 
+        for (const block of blocks) {
+            const before = previous.get(block.key);
+
+            // 首次出现可能只出现这一轮，先不标记，等它消失再处理，
+            // 否则会把只出现一次的稳定内容也挪到尾部，白白损失可缓存前缀。
+            if (before === undefined) continue;
+
+            if (before === block.body) continue;
+
+            const count = (changeCounts.get(block.key) ?? 0) + 1;
+            changeCounts.set(block.key, count);
+
+            if (count >= 2) remember(block.key);
+        }
+
+        // 上一轮有、这一轮消失的块，同样会截断前缀。
         for (const block of lastSystemBlocks.blocks) {
-            if (previous.has(block.head)) duplicates.add(block.head);
-            previous.set(block.head, block.body);
+            if (!currentKeys.has(block.key)) remember(block.key);
         }
+    }
 
-        for (const block of blocks) {
-            currentCounts.set(
-                block.head,
-                (currentCounts.get(block.head) ?? 0) + 1,
-            );
-        }
-
-        for (const block of blocks) {
-            if (block.head.length < 4
-                || duplicates.has(block.head)
-                || currentCounts.get(block.head) > 1
-                || !previous.has(block.head)
-                || previous.get(block.head) === block.body
-                || isVolatileHead(block.head)
-                || block.body.length > MAX_LEARN_CHARS) continue;
-
-            const count = (changeCounts.get(block.head) ?? 0) + 1;
-            changeCounts.set(block.head, count);
-
-            if (count < 2) continue;
-
-            s.learnedHeads.push(block.head);
-            learned.push(block.head);
-        }
-
-        if (learned.length) {
-            s.learnedHeads = [...new Set(s.learnedHeads)]
-                .slice(-MAX_LEARNED);
-            save();
-        }
+    if (learned.length) {
+        s.learnedHeads = [...new Set(s.learnedHeads)].slice(-MAX_LEARNED);
+        save();
     }
 
     lastSystemBlocks = { chatId: currentChat, blocks };
@@ -570,6 +629,76 @@ function sharedPrefix(a, b) {
         .reduce((sum, value) => sum + value.length + 1, 0) + at;
 
     return { k, at, chars };
+}
+
+// 中日韩字符按 1 个 token、其余按 4 字符 1 个 token 粗估，仅用于判断是否够门槛。
+function estimateTokens(value) {
+    const source = String(value ?? '');
+    let wide = 0;
+
+    for (const char of source) {
+        if (char.codePointAt(0) > 0x2e7f) wide++;
+    }
+
+    return Math.round(wide + (source.length - wide) / 4);
+}
+
+function excerpt(value, at, span = 36) {
+    return String(value ?? '')
+        .slice(Math.max(0, at - span), at + span)
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+// 指出前缀具体断在哪一块、断在哪几个字，而不只是给一个位置数字。
+function diffLines(previous, current, index) {
+    const before = previous.contents?.[index] ?? '';
+    const after = current.contents?.[index] ?? '';
+    const role = current.roles[index];
+
+    if (before === after) {
+        return [
+            `首个变化：第 ${index + 1} 条（${role}），正文相同但附加字段变化。`,
+            '常见原因：消息名、模型签名、工具调用字段或图片内容不同。',
+        ];
+    }
+
+    let at = 0;
+    while (at < before.length
+        && at < after.length
+        && before[at] === after[at]) at++;
+
+    const head = headOf({ content: before }) || '（空块）';
+
+    const hints = role === 'system'
+        ? [isVolatileHead(before)
+            ? '该块已标记为易变：本次仍留在前面，检查是否夹带工具调用或多模态消息。'
+            : '该块还没标记为易变：再生成一轮会自动识别，也可把块开头填进易变块列表。']
+        : ['变化落在聊天记录里：通常是历史被改写，或上下文窗口把旧消息挤出去了。'];
+
+    if (before.length < 40 || after.length < 40) {
+        hints.push('该块很短，可能只是临时插入的提示或标记。');
+    }
+
+    return [
+        `首个变化：第 ${index + 1} 条（${role}），正文第 ${at} 个字符。`,
+        `变化所在块开头：${head}`,
+        `原文：…${excerpt(before, at)}…`,
+        `现文：…${excerpt(after, at)}…`,
+        ...hints,
+    ];
+}
+
+function prefixTokenLines(contents, count) {
+    const tokens = estimateTokens(contents.slice(0, count).join('\n'));
+
+    return [
+        `相同前缀估算：约 ${tokens.toLocaleString()} tokens。`,
+        tokens > 0 && tokens < MIN_CACHE_TOKENS
+            ? `⚠ 低于常见 ${MIN_CACHE_TOKENS.toLocaleString()} tokens 门槛，`
+                + '即使内容一致也可能不返回缓存。'
+            : '',
+    ].filter(Boolean);
 }
 
 async function captureDryRun() {
@@ -664,7 +793,7 @@ async function checkStability() {
 
         const a = previous.map(stableJSON);
         const b = current.map(stableJSON);
-        const { k, at, chars } = sharedPrefix(a, b);
+        const { k, chars } = sharedPrefix(a, b);
         const total = b.reduce(
             (sum, value) => sum + value.length + 1, 0,
         );
@@ -683,15 +812,25 @@ async function checkStability() {
         const systemSame =
             leadingSystem(previous) === leadingSystem(current);
 
+        const before = {
+            contents: previous.map(text),
+            roles: previous.map(message => message.role ?? '?'),
+        };
+        const after = {
+            contents: current.map(text),
+            roles: current.map(message => message.role ?? '?'),
+        };
+
         report.text([
             `开头系统消息一致：${systemSame ? '✅ 是' : '❌ 否，可能影响缓存'}`,
             `消息序列化前缀相同：${
                 total ? (chars / total * 100).toFixed(1) : '0.0'
             }%（${chars.toLocaleString()} / ${total.toLocaleString()} 字符）`,
             `前 ${k} 条消息完整相同。`,
-            k < previous.length && k < current.length
-                ? `首个变化：第 ${k + 1} 条（${current[k]?.role}），序列化位置 ${at}。`
-                : '其中一组消息是另一组的完整前缀。',
+            ...(k < previous.length && k < current.length
+                ? diffLines(before, after, k)
+                : ['其中一组消息是另一组的完整前缀。']),
+            ...prefixTokenLines(after.contents, k),
             '这是字符稳定性比较，不是实际缓存 token 命中率。',
             '模拟不包含后端 Google 格式转换，以及部分扩展仅在真实生成时执行的修改。',
         ].join('\n'));
@@ -768,6 +907,7 @@ function recordRealRequest(rawBody) {
         type: String(body.type ?? '未标记'),
         stream: Boolean(body.stream),
         texts: body.messages.map(stableJSON),
+        contents: body.messages.map(text),
         roles: body.messages.map(message => message?.role ?? '?'),
         tools: toolDefinition(body),
         config: prefixConfig(body),
@@ -789,7 +929,7 @@ function recordRealRequest(rawBody) {
     }
 
     if (previous) {
-        const { k, at, chars } = sharedPrefix(
+        const { k, chars } = sharedPrefix(
             previous.texts, cur.texts,
         );
 
@@ -813,11 +953,14 @@ function recordRealRequest(rawBody) {
         } else if (k === cur.texts.length) {
             cur.lines.push('本次消息序列比上次更短。');
         } else {
-            cur.lines.push(
-                `首个变化：第 ${k + 1} 条（${cur.roles[k]}），`
-                + `序列化字符位置 ${at}。`,
-            );
+            cur.lines.push(...diffLines(previous, cur, k));
         }
+
+        cur.prefixState = k === cur.texts.length && k === previous.texts.length
+            ? 'identical'
+            : k === previous.texts.length ? 'append' : 'partial';
+
+        cur.lines.push(...prefixTokenLines(cur.contents, k));
 
         cur.lines.push(
             previous.tools === cur.tools
@@ -1037,7 +1180,10 @@ async function observeRealResponse(copy, cur) {
                 cur,
                 (state.cached > 0
                     ? `响应报告缓存命中：${state.cached.toLocaleString()} tokens`
-                    : '响应明确报告缓存为 0')
+                    : '响应明确报告缓存为 0'
+                        + (ZERO_HINTS[cur.prefixState]
+                            ? `\n判断：${ZERO_HINTS[cur.prefixState]}`
+                            : ''))
                     + ratio + `\n字段：${state.field}` + suffix,
             );
         } else {
@@ -1212,7 +1358,7 @@ function renderSettings() {
     <div class="cacheopt-settings">
       <div class="inline-drawer">
         <div class="inline-drawer-toggle inline-drawer-header">
-          <b>⚡ 缓存优化 2.4.6</b>
+          <b>⚡ 缓存优化 2.5.0</b>
           <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
         </div>
 
