@@ -115,20 +115,32 @@ test('历史裁剪后仍可识别尾部，按原顺序集中动态块并延长�
     assert.equal(prefix(), 3);
 });
 
-test('工具链、多模态、模型签名分别保留顺序', () => {
+test('工具链、多模态、模型签名保持相邻，易变块仍被移出前缀', () => {
     const { onPromptReady } = load(history);
-    const preserved = [
+    const volatileBlock = system('〔记忆系统私密简报\n动态');
+
+    const toolChain = [
         { role: 'assistant', content: '', tool_calls: [{ id: 'one' }] },
         { role: 'tool', content: 'result', tool_call_id: 'one' },
-        { role: 'assistant', content: '签名', signature: 'opaque' },
-        { role: 'user', content: [{ type: 'text', text: '附件' }] },
     ];
-    for (const message of preserved) {
-        const chat = [system('〔记忆系统私密简报\n动态'), ...history, message];
-        const original = [...chat];
-        onPromptReady({ chat });
-        assert.deepEqual(chat, original);
-    }
+
+    const chat = [volatileBlock, ...history, ...toolChain];
+    onPromptReady({ chat });
+
+    // 工具调用与结果必须保持相邻且顺序不变。
+    assert.equal(chat.indexOf(toolChain[0]) + 1, chat.indexOf(toolChain[1]));
+    // 易变块被移出前缀，不再排在历史之前。
+    assert.ok(chat.indexOf(volatileBlock) > chat.indexOf(history.at(-1)));
+
+    const signature = { role: 'assistant', content: '签名', signature: 'opaque' };
+    const chat2 = [volatileBlock, ...history, signature];
+    onPromptReady({ chat: chat2 });
+    assert.ok(chat2.indexOf(volatileBlock) > chat2.indexOf(history.at(-1)));
+
+    const multimodal = { role: 'user', content: [{ type: 'text', text: '附件' }] };
+    const chat3 = [volatileBlock, ...history, multimodal];
+    onPromptReady({ chat: chat3 });
+    assert.ok(chat3.indexOf(volatileBlock) > chat3.indexOf(history.at(-1)));
 });
 
 test('已知易变块立即后移，内容变化在第二次观察到时生效', () => {
@@ -176,6 +188,20 @@ test('时有时无的系统块被认出来后固定在尾部', () => {
     const chat = [stable, sometimes, ...history];
     onPromptReady({ chat });
     assert.equal(chat.at(-1), sometimes);
+});
+
+test('聊天记录中间每轮变化的系统块被学习并移出前缀', () => {
+    const { onPromptReady, settings } = load(history);
+    const stable = system('固定规则');
+    // 记忆块插在历史中间（用户消息之后），每轮内容不同。
+    for (let i = 0; i <= 2; i++) {
+        const mid = system(`剧情状态记录\n版本 ${i}`);
+        const chat = [stable, history[0], mid, history[1], history[2]];
+        onPromptReady({ chat });
+        // 稳定块和历史保持前缀，变化块被移到历史之后。
+        assert.ok(chat.indexOf(mid) > chat.indexOf(history.at(-1)));
+    }
+    assert.equal(settings().learnedHeads.at(-1), '剧情状态记录 版本 #');
 });
 
 test('真实请求对比指出断点所在块与前后原文', () => {

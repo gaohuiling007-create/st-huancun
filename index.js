@@ -1,4 +1,4 @@
-// ST-Cache-Optimizer 2.5.0
+// ST-Cache-Optimizer 2.6.0
 //
 // 只调整当前请求中的提示词，不修改世界书文件。
 // 请求诊断观察浏览器 -> 酒馆后端的消息及响应副本。
@@ -461,6 +461,16 @@ function canMoveSystem(message, keep) {
         && !keep.test(headOf(message));
 }
 
+// 一条消息若和它前面的消息构成不可拆的相邻关系，就标为锚点。
+// 工具调用必须紧跟产生它的 assistant，模型签名也不能和正文分开。
+function isAnchor(message, previous) {
+    if (message?.role === 'tool' || message?.tool_call_id) return true;
+    if (previous?.tool_calls && message?.role !== 'tool') return true;
+    if (message?.signature || previous?.signature) return true;
+    if (Array.isArray(message?.content)) return true;
+    return false;
+}
+
 function isMovableVolatile(message, keep) {
     return canMoveSystem(message, keep)
         && message.content.length <= MAX_LEARN_CHARS
@@ -488,8 +498,14 @@ function reorderFallback(chat, keep) {
 }
 
 function reorder(chat, range, keep) {
-    if (chat.some(message => message?.role === 'tool' || message?.tool_calls
-        || message?.tool_call_id || message?.signature || Array.isArray(message?.content))) return 0;
+    // 工具调用、签名、多模态只能保护它们自己所在的局部区间，
+    // 不该让整段前缀优化瘫痪。先算出锚点，再在锚点围出的安全段里移动。
+    const anchors = new Set();
+    for (let i = 0; i < chat.length; i++) {
+        if (isAnchor(chat[i], chat[i - 1])) anchors.add(i);
+    }
+
+    const safe = index => !anchors.has(index);
 
     if (!range) return reorderFallback(chat, keep);
 
@@ -500,7 +516,10 @@ function reorder(chat, range, keep) {
     for (let i = 0; i <= end; i++) {
         const message = chat[i];
         const early = i < start;
-        if (i < end && i !== start && canMoveSystem(message, keep)
+        const movable = canMoveSystem(message, keep) && safe(i);
+
+        // 锚点所在位置以及紧邻锚点之前的那条都保持原序，避免拆散工具链。
+        if (i < end && i !== start && movable && safe(i - 1)
             && (!early || isMovableVolatile(message, keep))) {
             moved.push(message);
         } else {
@@ -523,15 +542,25 @@ function learnFrom(chat, range, keep) {
     }
 
     const firstTurn = chat.findIndex(message => message?.role !== 'system');
-    const stop = firstTurn < 0 ? range.start : firstTurn;
+    // 学习范围：聊天记录之前的所有 system 块，加上聊天记录中间插入的
+    // system 块。中间的世界书条目、记忆块每轮内容在变，同样会截断前缀，
+    // 必须一并观察。锚点（工具调用/签名/多模态）不参与。
+    const stop = firstTurn < 0 ? chat.length : firstTurn;
+    const learnedIndexes = new Set();
+    for (let i = 0; i < stop; i++) learnedIndexes.add(i);
+    if (range) {
+        for (let i = range.start; i <= range.end; i++) learnedIndexes.add(i);
+    }
 
     // 同名块只取第一次出现，重复内容不算变化。
     const blocks = [];
     const seen = new Set();
 
-    for (const message of chat.slice(0, stop)) {
+    for (const i of [...learnedIndexes].sort((a, b) => a - b)) {
+        const message = chat[i];
         if (!canMoveSystem(message, keep)) continue;
         if (message.content.length > MAX_LEARN_CHARS) continue;
+        if (isAnchor(message, chat[i - 1])) continue;
 
         const key = blockKey(message.content);
         if (!key || seen.has(key)) continue;
@@ -1358,7 +1387,7 @@ function renderSettings() {
     <div class="cacheopt-settings">
       <div class="inline-drawer">
         <div class="inline-drawer-toggle inline-drawer-header">
-          <b>⚡ 缓存优化 2.5.0</b>
+          <b>⚡ 缓存优化 2.6.0</b>
           <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
         </div>
 
