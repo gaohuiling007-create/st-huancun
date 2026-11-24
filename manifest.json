@@ -1,12 +1,12 @@
 {
-  "display_name": "缓存优化 (Cache Optimizer)",
+  "display_name": "缓存优化 (Vertex 版)",
   "homePage": "https://github.com/pzwtxdy831-commits/ST-Cache-Optimizer",
   "loading_order": 120,
   "requires": [],
   "optional": [],
   "js": "index.js",
   "css": "style.css",
-  "author": "Claude (Anthropic), diagnostic fixes by OpenAI",
-  "version": "2.6.0",
+  "author": "Claude (Anthropic)",
+  "version": "2.4.3",
   "auto_update": false
 }
